@@ -19,6 +19,7 @@ export interface IDataAggregatorService {
   getHistoryLength(symbol: string): number;
   getCurrentPrice(symbol: string): number;
   setTriggerEngine(engine: ITriggerEngineService): void;
+  shutdown(): void;
 }
 
 export interface IMarketDataGateway {
