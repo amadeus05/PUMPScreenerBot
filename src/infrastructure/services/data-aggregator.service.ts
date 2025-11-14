@@ -81,6 +81,24 @@ export class DataAggregatorService implements IDataAggregatorService {
     this.triggerEngine = engine;
   }
 
+  private getBucketFillPercentage(
+    bucketMap: Map<string, Map<number, TimeBucket>>,
+    symbol: string,
+    maxSamplesPerBucket: number
+  ): string {
+    const symbolBuckets = bucketMap.get(symbol);
+    if (!symbolBuckets || symbolBuckets.size === 0) return '0%';
+  
+    let totalFillPercent = 0;
+    for (const bucket of symbolBuckets.values()) {
+      const fillPercent = Math.min((bucket.sampleCount / maxSamplesPerBucket) * 100, 100);
+      totalFillPercent += fillPercent;
+    }
+  
+    const avgFillPercent = totalFillPercent / symbolBuckets.size;
+    return `${avgFillPercent.toFixed(1)}%`;
+  }
+
   public updatePrice(symbol: string, price: number, timestamp: number): void {
     if (price <= 0) return;
 
@@ -102,9 +120,16 @@ export class DataAggregatorService implements IDataAggregatorService {
     if (updateCount % 100 === 0) {
       const buckets15s = this.buckets15sec.get(symbol)?.size || 0;
       const buckets1m = this.buckets1min.get(symbol)?.size || 0;
+      const buckets2m = this.buckets2min.get(symbol)?.size || 0;
       const buckets5m = this.buckets5min.get(symbol)?.size || 0;
+      
+      const fill15s = this.getBucketFillPercentage(this.buckets15sec, symbol, 15); // 15 samples max for 15s bucket
+      const fill1m = this.getBucketFillPercentage(this.buckets1min, symbol, 60);   // 60 samples max for 1m bucket
+      const fill2m = this.getBucketFillPercentage(this.buckets2min, symbol, 120);  // 120 samples max for 2m bucket
+      const fill5m = this.getBucketFillPercentage(this.buckets5min, symbol, 300);  // 300 samples max for 5m bucket
+      
       this.logger.debug(
-        `📦 ${symbol}: ${buckets15s}×15s, ${buckets1m}×1m, ${buckets5m}×5m buckets`,
+        `📦 ${symbol}: ${buckets15s}×15s(${fill15s}), ${buckets1m}×1m(${fill1m}), ${buckets2m}×2m(${fill2m}), ${buckets5m}×5m(${fill5m}) buckets`,
       );
     }
 
