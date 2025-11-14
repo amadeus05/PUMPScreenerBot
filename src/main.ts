@@ -5,8 +5,10 @@ import { DatabaseModule } from './infrastructure/database/database.module';
 import { Logger } from './shared/logger';
 import { registerDependencies } from './app.container';
 
+// Load environment variables
 config();
 
+// Import all necessary classes to ensure decorators are executed
 import './infrastructure/repositories/signal.repository';
 import './infrastructure/repositories/symbol-metadata.repository';
 import './infrastructure/services/binance-websocket.service';
@@ -19,73 +21,51 @@ import { PumpScoutBot } from './app';
 
 const logger = new Logger('Main');
 
+process.on('uncaughtException', (error) => {
+  logger.error('Uncaught Exception:', error);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('Unhandled Rejection at:', `promise: ${promise}, reason: ${reason}`);
+  process.exit(1);
+});
+
 async function bootstrap(): Promise<void> {
-  let app: PumpScoutBot | null = null;
-  
   try {
     logger.info('Starting Pump Scout Bot...');
 
+    // Register all dependencies
     registerDependencies();
+
+    // Initialize database
     await DatabaseModule.initialize();
 
-    app = DIContainer.getInstance().get<PumpScoutBot>(PumpScoutBot);
+    // Start the application
+    const app: PumpScoutBot = DIContainer.getInstance().get<PumpScoutBot>(PumpScoutBot);
     await app.start();
 
     logger.info('Pump Scout Bot started successfully');
 
-    let isShuttingDown = false;
+    // Graceful shutdown
+    let isShuttingDown = false; // prevent double shutdown
     const shutdown = async (signal: string): Promise<void> => {
-      if (isShuttingDown) {
-        logger.warn('Forced shutdown!');
-        process.exit(1);
-      }
-      
+      if (isShuttingDown) return;
       isShuttingDown = true;
       logger.info(`Received ${signal}, shutting down gracefully...`);
-      
-      const forceShutdownTimer = setTimeout(() => {
-        logger.error('Graceful shutdown timeout, forcing exit');
-        process.exit(1);
-      }, 30000);
-
       try {
-        if (app) {
-          await app.stop();
-        }
-        clearTimeout(forceShutdownTimer);
-      } catch (error) {
-        logger.error('Error during shutdown:', error);
+        await app.stop();
       } finally {
-        try {
-          await DatabaseModule.close();
-        } catch (error) {
-          logger.error('Error closing database:', error);
-        }
+        await DatabaseModule.close();
         process.exit(0);
       }
     };
 
+    // Use .once to avoid multiple handler invocations
     process.once('SIGINT', () => shutdown('SIGINT'));
     process.once('SIGTERM', () => shutdown('SIGTERM'));
-    
-    process.on('uncaughtException', async (error) => {
-      logger.error('Uncaught Exception:', error);
-      await shutdown('UNCAUGHT_EXCEPTION');
-    });
-
-    process.on('unhandledRejection', async (reason, promise) => {
-      logger.error('Unhandled Rejection:', { reason, promise });
-      await shutdown('UNHANDLED_REJECTION');
-    });
   } catch (error) {
     logger.error('Failed to start application:', error);
-    try {
-      if (app) {
-        await app.stop();
-      }
-    } catch (stopError) {
-      logger.error('Error stopping app:', stopError);
-    }
     await DatabaseModule.close();
     process.exit(1);
   }

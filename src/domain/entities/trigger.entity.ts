@@ -13,8 +13,8 @@ export class Trigger {
   @Column({ type: 'text' })
   direction!: Direction;
 
-  @Column({ name: 'price_change_percent', type: 'decimal', precision: 10, scale: 4 })
-  priceChangePercent!: number;
+  @Column({ name: 'price_change_percent', type: 'real' })
+  priceChangePercent!: number; // Changed from oiChangePercent
 
   @Column({ name: 'time_interval_minutes', type: 'integer' })
   timeIntervalMinutes!: number;

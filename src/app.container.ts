@@ -93,7 +93,7 @@ export function registerDependencies(): void {
       ),
   );
 
-  // --- Register Main App (FIX: Add DataAggregator injection) ---
+  // --- Register Main App ---
   container.bind(
     PumpScoutBot,
     () =>
@@ -103,7 +103,6 @@ export function registerDependencies(): void {
         container.get(TelegramBotService),
         container.get('ITriggerRepository'),
         container.get(CommandHandler),
-        container.get('IDataAggregatorService'), // ADD THIS LINE
       ),
   );
 }
