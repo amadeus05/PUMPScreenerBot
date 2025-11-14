@@ -1,4 +1,5 @@
-export type SignalQuality = 'strong' | 'medium' | 'weak';
+// ✅ REMOVED: SignalQuality type - not needed anymore
+// export type SignalQuality = 'strong' | 'medium' | 'weak';
 
 export class SignalDto {
   constructor(
@@ -6,9 +7,8 @@ export class SignalDto {
     public readonly symbol: string,
     public readonly priceChangePercent: number,
     public readonly currentPrice: number,
-    public readonly previousPrice: number, // NEW: track where it came from
+    public readonly previousPrice: number,
     public readonly timestamp: Date,
-    public readonly quality: SignalQuality,
     public readonly triggerIntervalMinutes?: number,
   ) {}
 }

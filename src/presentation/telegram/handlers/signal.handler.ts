@@ -37,11 +37,10 @@ export class SignalHandler {
       signal.symbol = signalDto.symbol;
       signal.priceChangePercent = signalDto.priceChangePercent;
       signal.currentPrice = signalDto.currentPrice;
-      signal.priceChangePercent = signalDto.priceChangePercent;
-      signal.currentPrice = signalDto.currentPrice;
 
       await this.signalRepository.save(signal);
 
+      // ✅ UPDATED: Removed quality parameter from signalDto
       await this.telegramBotService.sendSignal(
         userId,
         {
