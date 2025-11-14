@@ -102,7 +102,7 @@ export class DataAggregatorService implements IDataAggregatorService {
     if (updateCount % 100 === 0) {
       const buckets15s = this.buckets15sec.get(symbol)?.size || 0;
       const buckets1m = this.buckets1min.get(symbol)?.size || 0;
-      const buckets5m = this.buckets5min.get(symbol)?.size || 0;
+       const buckets5m = this.buckets5min.get(symbol)?.size || 0;
       this.logger.debug(
         `📦 ${symbol}: ${buckets15s}×15s, ${buckets1m}×1m, ${buckets5m}×5m buckets`,
       );
