@@ -1,8 +1,6 @@
-// STABLE DATA AGGREGATOR — PRODUCTION-READY (NO EMA) + FULL DEBUG + FALLBACK
-// - Lightweight production-ready aggregator for 1–30 minute intervals
-// - Uses 15s + 1m buckets only, robust warmup, MIN_SAMPLES default 1 (configurable)
-// - Exposes updatePrice, getMetricChanges, getAllKnownSymbols, getHistoryLength, getCurrentPrice, setTriggerEngine, visualizeBuckets
-// - NOTE: openInterest removed (not used)
+// Stable Data Aggregator — Production-ready, backward-compatible
+// Implements spec v1.0: event-time buckets (15s, 1m), strict warmup & fallback,
+// deterministic behavior, LRU eviction, monitoring endpoints.
 
 import { Injectable } from "../../shared/decorators";
 import {
@@ -18,52 +16,71 @@ type Bucket = {
   high: number;
   low: number;
   count: number;
-  firstTs: number;
-  lastTs: number;
+  firstTs: number; // event-time of first tick in bucket
+  lastTs: number; // event-time of last tick in bucket
 };
 
 @Injectable()
 export class DataAggregatorService implements IDataAggregatorService {
   private readonly logger = new Logger("StableAggregatorProd");
 
+  // buckets keyed by symbol -> bucketTime -> Bucket (bucketTime is event-time aligned)
   private buckets15s: Map<string, Map<number, Bucket>> = new Map();
   private buckets1m: Map<string, Map<number, Bucket>> = new Map();
 
+  // last known price and lastUpdate (event-time) used for LRU
   private lastKnownPrices: Map<string, number> = new Map();
+  private lastUpdateTs: Map<string, number> = new Map();
+
+  // firstSeen stores first event timestamp for the symbol (event-time)
   private firstSeen: Map<string, number> = new Map();
 
   private triggerEngine?: ITriggerEngineService | null = null;
 
-  // Tunables (env override)
+  // Tunables (env overrides)
   private readonly MAX_MINUTE_BUCKETS = Number(process.env.MAX_MINUTE_BUCKETS) || 70;
   private readonly MAX_15S_BUCKETS = Number(process.env.MAX_15S_BUCKETS) || 300;
-  private readonly MIN_BUCKET_SAMPLES = Number(process.env.MIN_BUCKET_SAMPLES) || 1; // tolerant default
-  private readonly WARMUP_FACTOR = Number(process.env.WARMUP_FACTOR) || 0.2; // faster warmup by default
-  private readonly DEBUG = Boolean(Number(process.env.DEBUG)) || Boolean(process.env.DEBUG === 'true');
+  private readonly MIN_BUCKET_SAMPLES = Number(process.env.MIN_BUCKET_SAMPLES) || 2; // safer default
+  private readonly DEBUG = process.env.DEBUG === 'true' || Boolean(Number(process.env.DEBUG));
 
-  // ---------------- Interface (backward-compatible) ----------------
+  // Eviction controls
+  private readonly SYMBOL_CHECK_INTERVAL = Number(process.env.SYMBOL_CHECK_INTERVAL) || 5_000; // ms throttle
+  private readonly MAX_TRACKED_SYMBOLS = Number(process.env.MAX_TRACKED_SYMBOLS) || 2000;
+  private lastSymbolCheck = 0;
+
+  // ---------------- Public API (backward-compatible) ----------------
 
   public updatePrice(symbol: string, price: number, timestamp: number): void {
     if (!symbol || !Number.isFinite(price) || !Number.isFinite(timestamp)) return;
 
-    // record last price
+    // record last known price and lastUpdate (use event timestamp)
     this.lastKnownPrices.set(symbol, price);
+    this.lastUpdateTs.set(symbol, timestamp);
 
-    // set firstSeen if new
-    if (!this.firstSeen.has(symbol)) this.firstSeen.set(symbol, Date.now());
+    // set firstSeen using event timestamp if not present
+    if (!this.firstSeen.has(symbol)) this.firstSeen.set(symbol, timestamp);
 
-    // use local time for bucket alignment
-    const tsLocal = Date.now();
+    // add point using event timestamp (CRITICAL for compatibility with original behavior)
+    this.addRawPoint(symbol, { timestamp, price });
 
-    // Add raw point (openInterest intentionally omitted)
-    this.addRawPoint(symbol, { timestamp: tsLocal, price });
-
-    // notify trigger engine non-blocking
+    // notify trigger engine (non-blocking, race-safe)
     if (this.triggerEngine && typeof this.triggerEngine.onPriceUpdate === 'function') {
+      // don't await; protect from throwing
       try {
         void this.triggerEngine.onPriceUpdate(symbol, price);
       } catch (err) {
         this.logger.error(`Trigger engine onPriceUpdate error: ${String(err)}`);
+      }
+    }
+
+    // throttled ensure symbol limit
+    const now = Date.now();
+    if (now - this.lastSymbolCheck > this.SYMBOL_CHECK_INTERVAL) {
+      this.lastSymbolCheck = now;
+      try {
+        this.ensureSymbolLimit();
+      } catch (err) {
+        this.logger.error(`ensureSymbolLimit error: ${String(err)}`);
       }
     }
   }
@@ -84,7 +101,9 @@ export class DataAggregatorService implements IDataAggregatorService {
   }
 
   public getHistoryLength(symbol: string): number {
-    return this.buckets1m.get(symbol)?.size ?? this.buckets15s.get(symbol)?.size ?? 0;
+    const m1 = this.buckets1m.get(symbol)?.size ?? 0;
+    const m15 = this.buckets15s.get(symbol)?.size ?? 0;
+    return Math.max(m1, m15);
   }
 
   public getCurrentPrice(symbol: string): number {
@@ -95,10 +114,56 @@ export class DataAggregatorService implements IDataAggregatorService {
     this.triggerEngine = engine;
   }
 
-  // ---------------- Ingestion ----------------
+  // Monitoring helper
+  public getBucketHealth(symbol: string, minutes: number): { availableBuckets: number; expectedBuckets: number; coveragePercent: number } {
+    const bucketSize = minutes <= 2 ? 15_000 : 60_000;
+    const store = bucketSize === 15_000 ? this.buckets15s : this.buckets1m;
+    const map = store.get(symbol);
+    if (!map) return { availableBuckets: 0, expectedBuckets: 0, coveragePercent: 0 };
+
+    const now = Date.now();
+    const durationMs = Math.round(minutes * 60_000);
+    const endBucket = Math.floor(now / bucketSize) * bucketSize;
+    const startBucket = Math.floor((now - durationMs) / bucketSize) * bucketSize;
+
+    // expected includes both boundaries inclusive
+    const expected = Math.round((endBucket - startBucket) / bucketSize) + 1;
+    const available = [...map.keys()].filter(k => k >= startBucket && k <= endBucket).length;
+    const coverage = expected === 0 ? 0 : Math.round((available / expected) * 100);
+    return { availableBuckets: available, expectedBuckets: expected, coveragePercent: coverage };
+  }
+
+  // Visualization for debugging (keeps compatibility)
+  public visualizeBuckets(symbol: string): void {
+    const m15 = this.buckets15s.get(symbol);
+    const m1 = this.buckets1m.get(symbol);
+    this.logger.debug(`--- BUCKETS ${symbol} ---`);
+    if (!m15 && !m1) {
+      this.logger.debug(`No buckets for ${symbol}`);
+      return;
+    }
+    if (m15) {
+      this.logger.debug(`15s:`);
+      [...m15.keys()].sort((a,b)=>a-b).forEach(ts => {
+        const b = m15.get(ts)!;
+        this.logger.debug(`15s ${new Date(ts).toISOString()} O=${b.open} C=${b.close} H=${b.high} L=${b.low} cnt=${b.count}`);
+      });
+    }
+    if (m1) {
+      this.logger.debug(`1m:`);
+      [...m1.keys()].sort((a,b)=>a-b).forEach(ts => {
+        const b = m1.get(ts)!;
+        this.logger.debug(`1m ${new Date(ts).toISOString()} O=${b.open} C=${b.close} H=${b.high} L=${b.low} cnt=${b.count}`);
+      });
+    }
+  }
+
+  // ---------------- Ingestion & Buckets ----------------
 
   private addRawPoint(symbol: string, point: { timestamp: number; price: number }): void {
-    const ts = point.timestamp;
+    // protect from future timestamps: clamp to now + 60s to avoid creating far-future buckets
+    const maxFuture = Date.now() + 60_000;
+    const ts = Math.min(Math.floor(point.timestamp), maxFuture);
     const price = point.price;
 
     if (!this.firstSeen.has(symbol)) this.firstSeen.set(symbol, ts);
@@ -106,8 +171,6 @@ export class DataAggregatorService implements IDataAggregatorService {
     this.updateBucket(symbol, ts, price, 15_000, this.buckets15s);
     this.updateBucket(symbol, ts, price, 60_000, this.buckets1m);
   }
-
-  // ---------------- Buckets ----------------
 
   private updateBucket(
     symbol: string,
@@ -139,6 +202,8 @@ export class DataAggregatorService implements IDataAggregatorService {
       if (this.DEBUG) this.logger.debug(`New bucket ${symbol} size=${bucketSize/1000}s at ${new Date(bucketTime).toISOString()}`);
     }
 
+    // update OHLC
+    if (b.count === 0) b.open = price;
     b.close = price;
     b.high = Math.max(b.high, price);
     b.low = Math.min(b.low, price);
@@ -161,7 +226,7 @@ export class DataAggregatorService implements IDataAggregatorService {
     if (this.DEBUG) this.logger.debug(`Cleanup ${symbol} ${bucketSize/1000}s: removed ${removing} buckets`);
   }
 
-  // ---------------- Calculation ----------------
+  // ---------------- Calculation with strict warmup & fallback ----------------
 
   private calculateBuckets(
     symbol: string,
@@ -178,32 +243,44 @@ export class DataAggregatorService implements IDataAggregatorService {
     const now = Date.now();
     const durationMs = Math.round(minutes * 60_000);
 
-    // Warmup check
+    // Warmup check: require either wall-clock history OR coverage threshold
     const first = this.firstSeen.get(symbol) ?? 0;
-    const required = Math.ceil(this.WARMUP_FACTOR * durationMs);
-    if (Date.now() - first < required) {
-      if (this.DEBUG) this.logger.debug(`Warmup: ${symbol} needs ${required}ms history`);
-      return null;
-    }
 
+    // wall-clock requirement (exact): require now - first >= durationMs for deterministic old behavior
+    const hasWallClock = (now - first) >= durationMs;
+
+    // coverage requirement: compute expected and available
     const endBucket = Math.floor(now / bucketSize) * bucketSize;
     const startBucket = Math.floor((now - durationMs) / bucketSize) * bucketSize;
 
-    const start = map.get(startBucket);
-    const end = map.get(endBucket);
+    const expectedBuckets = Math.round((endBucket - startBucket) / bucketSize) + 1;
+    const availableBuckets = [...map.keys()].filter(k => k >= startBucket && k <= endBucket).length;
+    const coveragePercent = expectedBuckets === 0 ? 0 : (availableBuckets / expectedBuckets) * 100;
 
-    if (this.DEBUG) this.logger.debug(`Calc ${symbol} ${minutes}m | bucket=${bucketSize/1000}s start=${startBucket}(${!!start}) end=${endBucket}(${!!end})`);
+    const coverageThreshold = minutes >= 5 ? 75 : 60; // spec thresholds
+
+    if (!hasWallClock && coveragePercent < coverageThreshold) {
+      if (this.DEBUG) this.logger.debug(`Warmup: ${symbol} needs either wall-clock (${durationMs}ms) or coverage >= ${coverageThreshold}%. have=${coveragePercent.toFixed(2)}%`);
+      return null;
+    }
+
+    // Find exact start & end buckets (prefer at-or-before boundary)
+    const startBucketKey = this.findNearestBucketAtOrBefore(map, startBucket);
+    const endBucketKey = this.findNearestBucketAtOrBefore(map, endBucket);
+
+    const start = startBucketKey !== null ? map.get(startBucketKey)! : undefined;
+    const end = endBucketKey !== null ? map.get(endBucketKey)! : undefined;
 
     if (!start || !end) {
       if (this.DEBUG) this.logger.debug(`Missing start or end for ${symbol}. Trying fallback`);
-      const fallback = this.interpolateFromBuckets(map, startBucket, endBucket, bucketSize);
+      const fallback = this.interpolateFromBuckets(map, startBucket, endBucket, bucketSize, durationMs);
       if (fallback) return fallback;
       return null;
     }
 
-    if (start.count < this.MIN_BUCKET_SAMPLES || end.count < this.MIN_BUCKET_SAMPLES) {
+    if (start.count < this.effectiveMinSamples(minutes) || end.count < this.effectiveMinSamples(minutes)) {
       if (this.DEBUG) this.logger.debug(`Insufficient samples for ${symbol}: start=${start.count} end=${end.count}`);
-      const fallback = this.interpolateFromBuckets(map, startBucket, endBucket, bucketSize);
+      const fallback = this.interpolateFromBuckets(map, startBucket, endBucket, bucketSize, durationMs);
       if (fallback) return fallback;
       return null;
     }
@@ -216,9 +293,9 @@ export class DataAggregatorService implements IDataAggregatorService {
     const priceChangePercent = ((end.close - start.open) / start.open) * 100;
     const currentPrice = end.close;
     const previousPrice = start.open;
-    const timeWindowSeconds = minutes * 60;
+    const timeWindowSeconds = minutes * 60; // ALWAYS fixed to requested window for compatibility
 
-    if (this.DEBUG) this.logger.info(`Metric ${symbol} ${minutes}m: ${priceChangePercent.toFixed(2)}% (${previousPrice}→${currentPrice})`);
+    if (this.DEBUG) this.logger.info(`Metric ${symbol} ${minutes}m: ${priceChangePercent.toFixed(4)}% (${previousPrice}→${currentPrice}) coverage=${coveragePercent.toFixed(1)}%`);
 
     return {
       priceChangePercent,
@@ -228,20 +305,75 @@ export class DataAggregatorService implements IDataAggregatorService {
     };
   }
 
-  // ---------------- Fallback interpolation ----------------
+  // effective minimum samples: stricter for larger windows
+  private effectiveMinSamples(minutes: number): number {
+    if (minutes >= 5) return Math.max(2, this.MIN_BUCKET_SAMPLES);
+    return this.MIN_BUCKET_SAMPLES;
+  }
+
+  // find greatest key <= boundary, or null if none
+  private findNearestBucketAtOrBefore(map: Map<number, Bucket>, boundary: number): number | null {
+    const keys = [...map.keys()].sort((a, b) => a - b);
+    let candidate: number | null = null;
+    for (const k of keys) {
+      if (k <= boundary) candidate = k;
+      else break;
+    }
+    return candidate;
+  }
+
+  // ---------------- Fallback interpolation (strict shift limits) ----------------
+  // allowed shift <= min(2*bucketSize, durationMs * 0.05)
 
   private interpolateFromBuckets(
     map: Map<number, Bucket>,
     startBucket: number,
     endBucket: number,
     bucketSize: number,
+    durationMs: number,
   ): IMetricChanges | null {
     const keys = [...map.keys()].sort((a, b) => a - b);
     if (keys.length === 0) return null;
 
-    const startKey = keys.find(k => k >= startBucket) ?? keys[0];
-    const endKeys = keys.filter(k => k <= endBucket);
-    const endKey = endKeys.length ? endKeys[endKeys.length - 1] : keys[keys.length - 1];
+    // candidate start: greatest key <= startBucket OR smallest key > startBucket (if forward-shift allowed)
+    const beforeStart = keys.filter(k => k <= startBucket);
+    const afterStart = keys.filter(k => k > startBucket);
+
+    let startKey: number | null = null;
+    if (beforeStart.length) startKey = beforeStart[beforeStart.length - 1];
+    else if (afterStart.length) {
+      const candidate = afterStart[0];
+      const forwardShift = candidate - startBucket;
+      const forwardLimit = Math.min(2 * bucketSize, durationMs * 0.05);
+      if (forwardShift <= forwardLimit) startKey = candidate; // allow small forward shift
+      else {
+        if (this.DEBUG) this.logger.debug(`Fallback reject: forward shift ${forwardShift} > ${forwardLimit}`);
+        return null;
+      }
+    }
+
+    // candidate end: greatest key <= endBucket OR last key if none (but limit backward shift)
+    const beforeEnd = keys.filter(k => k <= endBucket);
+    const afterEnd = keys.filter(k => k > endBucket);
+
+    let endKey: number | null = null;
+    if (beforeEnd.length) endKey = beforeEnd[beforeEnd.length - 1];
+    else {
+      const candidate = keys[keys.length - 1];
+      const backwardShift = endBucket - candidate; // positive if candidate < endBucket
+      const backwardLimit = Math.min(2 * bucketSize, durationMs * 0.05);
+      if (backwardShift <= backwardLimit) endKey = candidate;
+      else {
+        if (this.DEBUG) this.logger.debug(`Fallback reject: backward shift ${backwardShift} > ${backwardLimit}`);
+        return null;
+      }
+    }
+
+    if (startKey === null || endKey === null) return null;
+    if (startKey > endKey) {
+      if (this.DEBUG) this.logger.debug(`Fallback reject: startKey ${startKey} > endKey ${endKey}`);
+      return null;
+    }
 
     const s = map.get(startKey)!;
     const e = map.get(endKey)!;
@@ -250,9 +382,11 @@ export class DataAggregatorService implements IDataAggregatorService {
     if (s.open <= 0 || e.close <= 0) return null;
 
     const pct = ((e.close - s.open) / s.open) * 100;
-    const timeWindowSeconds = Math.round((e.lastTs - s.firstTs) / 1000) || Math.round((endBucket - startBucket) / 1000);
 
-    if (this.DEBUG) this.logger.debug(`Interpolated ${pct.toFixed(2)}% using ${new Date(startKey).toISOString()} -> ${new Date(endKey).toISOString()}`);
+    // IMPORTANT: return fixed requested time window (compatibility)
+    const timeWindowSeconds = Math.round(durationMs / 1000);
+
+    if (this.DEBUG) this.logger.debug(`Interpolated ${pct.toFixed(4)}% using ${new Date(startKey).toISOString()} -> ${new Date(endKey).toISOString()}`);
 
     return {
       priceChangePercent: pct,
@@ -262,29 +396,44 @@ export class DataAggregatorService implements IDataAggregatorService {
     };
   }
 
-  // ---------------- Visualization ----------------
+  // ---------------- LRU Eviction ----------------
+  private ensureSymbolLimit(): void {
+    // Remove symbols that haven't been updated for TTL (24h) to avoid memory leak from one-off symbols
+    const TTL = 24 * 60 * 60 * 1000; // 24 hours in ms
+    const now = Date.now();
 
-  public visualizeBuckets(symbol: string): void {
-    const m15 = this.buckets15s.get(symbol);
-    const m1 = this.buckets1m.get(symbol);
-    this.logger.debug(`--- BUCKETS ${symbol} ---`);
-    if (!m15 && !m1) {
-      this.logger.debug(`No buckets for ${symbol}`);
-      return;
+    // Fast path: iterate over lastUpdateTs (O(n) but minimal allocations)
+    for (const [sym, ts] of this.lastUpdateTs.entries()) {
+      if (now - ts > TTL) {
+        this.evictSymbol(sym);
+        if (this.DEBUG) this.logger.info(`Evicted symbol ${sym} due to TTL`);
+      }
     }
-    if (m15) {
-      this.logger.debug(`15s:`);
-      [...m15.keys()].sort((a,b)=>a-b).forEach(ts => {
-        const b = m15.get(ts)!;
-        this.logger.debug(`15s ${new Date(ts).toISOString()} O=${b.open} C=${b.close} H=${b.high} L=${b.low} cnt=${b.count}`);
-      });
+
+    // After TTL purge, check limit
+    const total = this.lastUpdateTs.size;
+    if (total <= this.MAX_TRACKED_SYMBOLS) return;
+
+    // Build array from lastUpdateTs entries (no extra getAllKnownSymbols allocations)
+    const arr: Array<{ s: string; ts: number }> = [];
+    for (const [s, ts] of this.lastUpdateTs.entries()) {
+      arr.push({ s, ts });
     }
-    if (m1) {
-      this.logger.debug(`1m:`);
-      [...m1.keys()].sort((a,b)=>a-b).forEach(ts => {
-        const b = m1.get(ts)!;
-        this.logger.debug(`1m ${new Date(ts).toISOString()} O=${b.open} C=${b.close} H=${b.high} L=${b.low} cnt=${b.count}`);
-      });
+
+    arr.sort((a, b) => a.ts - b.ts); // oldest first
+    const removeCount = total - this.MAX_TRACKED_SYMBOLS;
+    for (let i = 0; i < removeCount; i++) {
+      const r = arr[i];
+      this.evictSymbol(r.s);
+      if (this.DEBUG) this.logger.info(`Evicted symbol ${r.s} due to LRU policy`);
     }
+  }
+
+  private evictSymbol(symbol: string): void {
+    this.buckets15s.delete(symbol);
+    this.buckets1m.delete(symbol);
+    this.lastKnownPrices.delete(symbol);
+    this.lastUpdateTs.delete(symbol);
+    this.firstSeen.delete(symbol);
   }
 }
