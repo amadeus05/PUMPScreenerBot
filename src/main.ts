@@ -18,6 +18,10 @@ import './presentation/telegram/handlers/signal.handler';
 
 import { PumpScoutBot } from './app';
 
+console.log('ENV CHECK:', {
+  hasToken: !!process.env.TELEGRAM_BOT_TOKEN,
+});
+
 const logger = new Logger('Main');
 
 process.on('uncaughtException', (error) => {
