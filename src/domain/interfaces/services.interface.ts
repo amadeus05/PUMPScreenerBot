@@ -24,6 +24,8 @@ export interface IDataAggregatorService {
 export interface IMarketDataGateway {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
+  getActiveProviders?(): string[];
+  getProvidersHealth?(): Record<string, any>;
 }
 
 export interface ITriggerEngineService {
