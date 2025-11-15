@@ -1,6 +1,7 @@
 // Stable Data Aggregator — Production-ready, backward-compatible
 // Implements spec v1.0: event-time buckets (15s, 1m), strict warmup & fallback,
 // deterministic behavior, LRU eviction, monitoring endpoints.
+// FIXED: Correct OHLC handling for out-of-order ticks
 
 import { Injectable } from "../../shared/decorators";
 import {
@@ -40,13 +41,17 @@ export class DataAggregatorService implements IDataAggregatorService {
   // Tunables (env overrides)
   private readonly MAX_MINUTE_BUCKETS = Number(process.env.MAX_MINUTE_BUCKETS) || 70;
   private readonly MAX_15S_BUCKETS = Number(process.env.MAX_15S_BUCKETS) || 300;
-  private readonly MIN_BUCKET_SAMPLES = Number(process.env.MIN_BUCKET_SAMPLES) || 2; // safer default
+  private readonly MIN_BUCKET_SAMPLES = Number(process.env.MIN_BUCKET_SAMPLES) || 2;
   private readonly DEBUG = process.env.DEBUG === 'true' || Boolean(Number(process.env.DEBUG));
+  private readonly FALLBACK_SHIFT_MULTIPLIER = Number(process.env.FALLBACK_SHIFT_MULTIPLIER) || 2;
 
   // Eviction controls
-  private readonly SYMBOL_CHECK_INTERVAL = Number(process.env.SYMBOL_CHECK_INTERVAL) || 5_000; // ms throttle
+  private readonly SYMBOL_CHECK_INTERVAL = Number(process.env.SYMBOL_CHECK_INTERVAL) || 5_000;
   private readonly MAX_TRACKED_SYMBOLS = Number(process.env.MAX_TRACKED_SYMBOLS) || 2000;
   private lastSymbolCheck = 0;
+
+  // Out-of-order tracking
+  private outOfOrderWarnings: Map<string, number> = new Map(); // symbol -> count
 
   // ---------------- Public API (backward-compatible) ----------------
 
@@ -158,6 +163,12 @@ export class DataAggregatorService implements IDataAggregatorService {
     }
   }
 
+  // New: Get out-of-order statistics
+  public getOutOfOrderStats(symbol?: string): Record<string, number> | number {
+    if (symbol) return this.outOfOrderWarnings.get(symbol) ?? 0;
+    return Object.fromEntries(this.outOfOrderWarnings);
+  }
+
   // ---------------- Ingestion & Buckets ----------------
 
   private addRawPoint(symbol: string, point: { timestamp: number; price: number }): void {
@@ -202,13 +213,36 @@ export class DataAggregatorService implements IDataAggregatorService {
       if (this.DEBUG) this.logger.debug(`New bucket ${symbol} size=${bucketSize/1000}s at ${new Date(bucketTime).toISOString()}`);
     }
 
-    // update OHLC
-    if (b.count === 0) b.open = price;
-    b.close = price;
+    // CRITICAL FIX: Update open/close based on event-time, not arrival order
+    // This ensures correct OHLC even with out-of-order ticks
+    if (ts < b.firstTs) {
+      b.open = price;
+      b.firstTs = ts;
+      
+      // Track out-of-order for monitoring
+      if (b.count > 0) {
+        const count = this.outOfOrderWarnings.get(symbol) ?? 0;
+        this.outOfOrderWarnings.set(symbol, count + 1);
+        
+        if (this.DEBUG) {
+          this.logger.warn(
+            `Out-of-order tick for ${symbol}: new ts=${new Date(ts).toISOString()}, ` +
+            `was firstTs=${new Date(b.firstTs + (ts - b.firstTs)).toISOString()}, ` +
+            `shift=${b.firstTs + (ts - b.firstTs) - ts}ms`
+          );
+        }
+      }
+    }
+    
+    if (ts > b.lastTs) {
+      b.close = price;
+      b.lastTs = ts;
+    }
+
+    // High/low are order-independent
     b.high = Math.max(b.high, price);
     b.low = Math.min(b.low, price);
     b.count++;
-    b.lastTs = ts;
 
     this.cleanup(store, symbol, bucketSize);
   }
@@ -290,12 +324,20 @@ export class DataAggregatorService implements IDataAggregatorService {
       return null;
     }
 
-    const priceChangePercent = ((end.close - start.open) / start.open) * 100;
+    // Use higher precision for financial calculations
+    const priceChangePercent = Number(
+      (((end.close - start.open) / start.open) * 100).toFixed(6)
+    );
     const currentPrice = end.close;
     const previousPrice = start.open;
     const timeWindowSeconds = minutes * 60; // ALWAYS fixed to requested window for compatibility
 
-    if (this.DEBUG) this.logger.info(`Metric ${symbol} ${minutes}m: ${priceChangePercent.toFixed(4)}% (${previousPrice}→${currentPrice}) coverage=${coveragePercent.toFixed(1)}%`);
+    if (this.DEBUG) {
+      this.logger.info(
+        `Metric ${symbol} ${minutes}m: ${priceChangePercent.toFixed(4)}% ` +
+        `(${previousPrice}→${currentPrice}) coverage=${coveragePercent.toFixed(1)}%`
+      );
+    }
 
     return {
       priceChangePercent,
@@ -322,8 +364,8 @@ export class DataAggregatorService implements IDataAggregatorService {
     return candidate;
   }
 
-  // ---------------- Fallback interpolation (strict shift limits) ----------------
-  // allowed shift <= min(2*bucketSize, durationMs * 0.05)
+  // ---------------- Fallback interpolation (configurable shift limits) ----------------
+  // allowed shift <= min(FALLBACK_SHIFT_MULTIPLIER * bucketSize, durationMs * 0.05)
 
   private interpolateFromBuckets(
     map: Map<number, Bucket>,
@@ -344,7 +386,7 @@ export class DataAggregatorService implements IDataAggregatorService {
     else if (afterStart.length) {
       const candidate = afterStart[0];
       const forwardShift = candidate - startBucket;
-      const forwardLimit = Math.min(2 * bucketSize, durationMs * 0.05);
+      const forwardLimit = Math.min(this.FALLBACK_SHIFT_MULTIPLIER * bucketSize, durationMs * 0.05);
       if (forwardShift <= forwardLimit) startKey = candidate; // allow small forward shift
       else {
         if (this.DEBUG) this.logger.debug(`Fallback reject: forward shift ${forwardShift} > ${forwardLimit}`);
@@ -354,14 +396,13 @@ export class DataAggregatorService implements IDataAggregatorService {
 
     // candidate end: greatest key <= endBucket OR last key if none (but limit backward shift)
     const beforeEnd = keys.filter(k => k <= endBucket);
-    const afterEnd = keys.filter(k => k > endBucket);
 
     let endKey: number | null = null;
     if (beforeEnd.length) endKey = beforeEnd[beforeEnd.length - 1];
     else {
       const candidate = keys[keys.length - 1];
       const backwardShift = endBucket - candidate; // positive if candidate < endBucket
-      const backwardLimit = Math.min(2 * bucketSize, durationMs * 0.05);
+      const backwardLimit = Math.min(this.FALLBACK_SHIFT_MULTIPLIER * bucketSize, durationMs * 0.05);
       if (backwardShift <= backwardLimit) endKey = candidate;
       else {
         if (this.DEBUG) this.logger.debug(`Fallback reject: backward shift ${backwardShift} > ${backwardLimit}`);
@@ -381,12 +422,18 @@ export class DataAggregatorService implements IDataAggregatorService {
     if (s.count < 1 || e.count < 1) return null;
     if (s.open <= 0 || e.close <= 0) return null;
 
-    const pct = ((e.close - s.open) / s.open) * 100;
+    // Use higher precision for financial calculations
+    const pct = Number((((e.close - s.open) / s.open) * 100).toFixed(6));
 
     // IMPORTANT: return fixed requested time window (compatibility)
     const timeWindowSeconds = Math.round(durationMs / 1000);
 
-    if (this.DEBUG) this.logger.debug(`Interpolated ${pct.toFixed(4)}% using ${new Date(startKey).toISOString()} -> ${new Date(endKey).toISOString()}`);
+    if (this.DEBUG) {
+      this.logger.debug(
+        `Interpolated ${pct.toFixed(4)}% using ` +
+        `${new Date(startKey).toISOString()} -> ${new Date(endKey).toISOString()}`
+      );
+    }
 
     return {
       priceChangePercent: pct,
@@ -435,5 +482,6 @@ export class DataAggregatorService implements IDataAggregatorService {
     this.lastKnownPrices.delete(symbol);
     this.lastUpdateTs.delete(symbol);
     this.firstSeen.delete(symbol);
+    this.outOfOrderWarnings.delete(symbol);
   }
 }
