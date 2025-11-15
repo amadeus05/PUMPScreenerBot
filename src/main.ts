@@ -13,7 +13,6 @@ import './infrastructure/repositories/signal.repository';
 import './infrastructure/repositories/symbol-metadata.repository';
 import './infrastructure/services/binance-websocket.service';
 import './infrastructure/telegram/telegram.bot';
-import './infrastructure/http/binance-api.client';
 import './presentation/telegram/handlers/command.handler';
 import './presentation/telegram/handlers/signal.handler';
 

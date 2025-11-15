@@ -9,7 +9,6 @@ import { BinanceWebSocketService } from './infrastructure/services/binance-webso
 import { NotificationService } from './infrastructure/services/notification.service';
 import { TriggerEngineService } from './infrastructure/services/trigger-engine.service';
 
-import { BinanceApiClient } from './infrastructure/http/binance-api.client';
 import { TelegramBotService } from './infrastructure/telegram/telegram.bot';
 import { CommandHandler } from './presentation/telegram/handlers/command.handler';
 import { SignalHandler } from './presentation/telegram/handlers/signal.handler';
@@ -74,7 +73,6 @@ export function registerDependencies(): void {
         container.get(UptimeService),
       ),
   );
-  container.bind(BinanceApiClient, () => new BinanceApiClient());
 
   const triggerEngine = container.get('ITriggerEngineService') as ITriggerEngineService;
   const dataAggregator = container.get('IDataAggregatorService') as IDataAggregatorService;
