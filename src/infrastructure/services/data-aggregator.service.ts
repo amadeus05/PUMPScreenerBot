@@ -1,5 +1,5 @@
-// Production-Ready Data Aggregator Service v2.1
-// Fixed: O(N log N) sorting bottleneck with cached sorted keys
+// Production-Ready Data Aggregator Service v2.2
+// Implemented: Variant B — event-time interpolation for bucket.open/close (boundary-correct OHLC)
 
 import { Injectable } from "../../shared/decorators";
 import {
@@ -10,13 +10,13 @@ import {
 import { Logger } from "../../shared/logger";
 
 type Bucket = {
-  open: number;
-  close: number;
+  open: number;    // price of the first tick observed inside this bucket (may be adjusted via interpolation at boundary)
+  close: number;   // price of the last tick observed inside this bucket (may be adjusted via interpolation at boundary)
   high: number;
   low: number;
   count: number;
-  firstTs: number;
-  lastTs: number;
+  firstTs: number; // timestamp of the first tick in this bucket (event-time)
+  lastTs: number;  // timestamp of the last tick in this bucket (event-time)
 };
 
 type HealthStats = {
@@ -469,56 +469,150 @@ export class DataAggregatorService implements IDataAggregatorService {
       return null;
     }
 
-    // ✅ FIND EXACT BUCKETS (at-or-before boundaries)
+    // ✅ COMPUTE INTERPOLATED BOUNDARY PRICES (event-time correct)
+    const startPrice = this.getPriceAtBoundary(map, startBucket);
+    const endPrice = this.getPriceAtBoundary(map, endBucket);
+
+    if (startPrice === null || endPrice === null) {
+      if (this.DEBUG) this.logger.debug(`🔄 Missing boundaries (interpolation failed), trying fallback`);
+      return this.fallbackInterpolation(map, startBucket, endBucket, bucketSize, durationMs, minutes);
+    }
+
+    // ✅ CHECK MINIMUM SAMPLES for confidence (still meaningful)
+    const minSamples = this.effectiveMinSamples(minutes);
     const startBucketKey = this.findNearestBucketAtOrBefore(map, startBucket);
     const endBucketKey = this.findNearestBucketAtOrBefore(map, endBucket);
 
-    const start = startBucketKey !== null ? map.get(startBucketKey) : undefined;
-    const end = endBucketKey !== null ? map.get(endBucketKey) : undefined;
+    const startBucketObj = startBucketKey !== null ? map.get(startBucketKey) : undefined;
+    const endBucketObj = endBucketKey !== null ? map.get(endBucketKey) : undefined;
 
-    if (!start || !end) {
-      if (this.DEBUG) this.logger.debug(`🔄 Missing boundaries, trying fallback`);
-      return this.fallbackInterpolation(map, startBucket, endBucket, bucketSize, durationMs, minutes);
-    }
-
-    // ✅ CHECK MINIMUM SAMPLES
-    const minSamples = this.effectiveMinSamples(minutes);
-    if (start.count < minSamples || end.count < minSamples) {
-      if (this.DEBUG) {
-        this.logger.debug(
-          `📊 Insufficient samples: start=${start.count} end=${end.count} (need ${minSamples})`
-        );
+    if (startBucketObj && endBucketObj) {
+      if (startBucketObj.count < minSamples || endBucketObj.count < minSamples) {
+        if (this.DEBUG) {
+          this.logger.debug(
+            `📊 Insufficient samples: start=${startBucketObj.count} end=${endBucketObj.count} (need ${minSamples})`
+          );
+        }
+        return this.fallbackInterpolation(map, startBucket, endBucket, bucketSize, durationMs, minutes);
       }
-      return this.fallbackInterpolation(map, startBucket, endBucket, bucketSize, durationMs, minutes);
     }
 
-    if (start.open <= 0 || end.close <= 0) {
-      if (this.DEBUG) this.logger.debug(`❌ Invalid prices in buckets`);
+    if (startPrice <= 0 || endPrice <= 0) {
+      if (this.DEBUG) this.logger.debug(`❌ Invalid interpolated prices at boundaries`);
       return null;
     }
 
     // ✅ CALCULATE WITH HIGH PRECISION
-    const priceChangePercent = Number(
-      (((end.close - start.open) / start.open) * 100).toFixed(6)
-    );
+    const priceChangePercent = Number((((endPrice - startPrice) / startPrice) * 100).toFixed(6));
 
     const result: IMetricChanges = {
       priceChangePercent,
-      currentPrice: end.close,
-      previousPrice: start.open,
-      timeWindowSeconds: minutes * 60,
+      currentPrice: endPrice,
+      previousPrice: startPrice,
+      timeWindowSeconds: minutes * 60, // Fixed to requested interval
     };
 
     if (this.DEBUG) {
       this.logger.info(
         `✅ ${symbol} ${minutes}m: ${priceChangePercent.toFixed(4)}% ` +
-        `(${start.open.toFixed(6)} → ${end.close.toFixed(6)}) ` +
+        `(${startPrice.toFixed(6)} → ${endPrice.toFixed(6)}) ` +
         `coverage=${coveragePercent.toFixed(1)}%`
       );
     }
 
     return result;
   }
+
+  // ==================== BOUNDARY INTERPOLATION HELPERS ====================
+
+  // Return price at exact boundary (event-time). Uses neighbouring bucket first/last ticks to interpolate.
+  private getPriceAtBoundary(map: SortedBucketMap, boundary: number): number | null {
+    const keys = map.getSortedKeys();
+    if (keys.length === 0) return null;
+
+    // Binary search to find index of largest key <= boundary
+    let left = 0;
+    let right = keys.length - 1;
+    let idx = -1;
+    while (left <= right) {
+      const mid = Math.floor((left + right) / 2);
+      if (keys[mid] <= boundary) {
+        idx = mid;
+        left = mid + 1;
+      } else {
+        right = mid - 1;
+      }
+    }
+
+    const leftKey = idx >= 0 ? keys[idx] : null;
+    const rightKey = (idx + 1) < keys.length ? keys[idx + 1] : null;
+
+    // If boundary lies inside a single bucket (i.e., both keys are same bucket)
+    if (leftKey !== null && leftKey === rightKey) {
+      const b = map.get(leftKey)!;
+      // If we have firstTs/lastTs inside this bucket, interpolate within bucket
+      if (b.firstTs <= boundary && boundary <= b.lastTs) {
+        return this.interpolate(b.firstTs, b.open, b.lastTs, b.close, boundary);
+      }
+      // otherwise fall back to nearest observed tick in bucket
+      if (boundary < b.firstTs) return b.open;
+      return b.close;
+    }
+
+    // If both sides exist and belong to different buckets
+    const leftBucket = leftKey !== null ? map.get(leftKey) : undefined;
+    const rightBucket = rightKey !== null ? map.get(rightKey) : undefined;
+
+    // If boundary falls within leftBucket's observed time-range, interpolate inside it
+    if (leftBucket && leftBucket.firstTs <= boundary && boundary <= leftBucket.lastTs) {
+      return this.interpolate(leftBucket.firstTs, leftBucket.open, leftBucket.lastTs, leftBucket.close, boundary);
+    }
+
+    // If boundary falls within rightBucket's observed time-range, interpolate inside it
+    if (rightBucket && rightBucket.firstTs <= boundary && boundary <= rightBucket.lastTs) {
+      return this.interpolate(rightBucket.firstTs, rightBucket.open, rightBucket.lastTs, rightBucket.close, boundary);
+    }
+
+    // Otherwise, we need to interpolate across buckets using leftBucket.last (close) and rightBucket.first (open)
+    if (leftBucket && rightBucket) {
+      const prevTime = leftBucket.lastTs;
+      const prevPrice = leftBucket.close;
+      const nextTime = rightBucket.firstTs;
+      const nextPrice = rightBucket.open;
+
+      // If timestamps are ordered correctly, perform interpolation
+      if (prevTime <= boundary && boundary <= nextTime && nextTime > prevTime) {
+        return this.interpolate(prevTime, prevPrice, nextTime, nextPrice, boundary);
+      }
+
+      // Edge cases: fall back to closest side
+      const leftDelta = Math.abs(boundary - prevTime);
+      const rightDelta = Math.abs(nextTime - boundary);
+      return leftDelta <= rightDelta ? prevPrice : nextPrice;
+    }
+
+    // Only left exists
+    if (leftBucket) {
+      // If boundary is after last observed tick in leftBucket, return last observed price
+      return leftBucket.close;
+    }
+
+    // Only right exists
+    if (rightBucket) {
+      return rightBucket.open;
+    }
+
+    return null;
+  }
+
+  // Linear interpolation
+  private interpolate(t0: number, p0: number, t1: number, p1: number, t: number): number {
+    if (t1 === t0) return p0; // degenerate
+    const ratio = (t - t0) / (t1 - t0);
+    return p0 + (p1 - p0) * ratio;
+  }
+
+  // ==================== OTHER HELPERS ====================
 
   // ✅ OPTIMIZED: Binary search on cached sorted keys
   private findNearestBucketAtOrBefore(map: SortedBucketMap, boundary: number): number | null {
@@ -559,6 +653,7 @@ export class DataAggregatorService implements IDataAggregatorService {
     durationMs: number,
     minutes: number,
   ): IMetricChanges | null {
+    this.fallbacksUsed++;
     // ✅ OPTIMIZED: Use cached sorted keys
     const keys = map.getSortedKeys();
     if (keys.length === 0) return null;
@@ -575,7 +670,15 @@ export class DataAggregatorService implements IDataAggregatorService {
     let startKey: number | null = null;
     if (beforeStart.length > 0) {
       startKey = beforeStart[beforeStart.length - 1];
-    } else if (afterStart.length > 0) {
+      // Ensure backward shift not too large
+      const shiftBack = startBucket - startKey;
+      if (shiftBack > maxShift) {
+        if (this.DEBUG) this.logger.debug(`❌ Backward start shift too large: ${shiftBack}ms > ${maxShift}ms`);
+        startKey = null;
+      }
+    }
+
+    if (startKey === null && afterStart.length > 0) {
       const candidate = afterStart[0];
       const shift = candidate - startBucket;
       if (shift <= maxShift) {
@@ -593,7 +696,14 @@ export class DataAggregatorService implements IDataAggregatorService {
     
     if (beforeEnd.length > 0) {
       endKey = beforeEnd[beforeEnd.length - 1];
-    } else {
+      const shiftBack = endBucket - endKey;
+      if (shiftBack > maxShift) {
+        if (this.DEBUG) this.logger.debug(`❌ Backward end shift too large: ${shiftBack}ms > ${maxShift}ms`);
+        endKey = null;
+      }
+    }
+
+    if (endKey === null) {
       const candidate = keys[keys.length - 1];
       const shift = endBucket - candidate;
       if (shift <= maxShift) {
@@ -612,11 +722,15 @@ export class DataAggregatorService implements IDataAggregatorService {
     const s = map.get(startKey)!;
     const e = map.get(endKey)!;
 
-    if (s.count < 1 || e.count < 1 || s.open <= 0 || e.close <= 0) {
+    // Use interpolated prices at boundaries if possible
+    const startPrice = this.getPriceAtBoundary(map, startBucket) ?? s.open;
+    const endPrice = this.getPriceAtBoundary(map, endBucket) ?? e.close;
+
+    if (s.count < 1 || e.count < 1 || startPrice <= 0 || endPrice <= 0) {
       return null;
     }
 
-    const priceChangePercent = Number((((e.close - s.open) / s.open) * 100).toFixed(6));
+    const priceChangePercent = Number((((endPrice - startPrice) / startPrice) * 100).toFixed(6));
 
     if (this.DEBUG) {
       this.logger.warn(
@@ -627,8 +741,8 @@ export class DataAggregatorService implements IDataAggregatorService {
 
     return {
       priceChangePercent,
-      currentPrice: e.close,
-      previousPrice: s.open,
+      currentPrice: endPrice,
+      previousPrice: startPrice,
       timeWindowSeconds: minutes * 60,
     };
   }
