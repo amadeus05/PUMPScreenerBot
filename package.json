@@ -2,7 +2,6 @@
   "name": "pump-scout-bot",
   "version": "1.0.0",
   "description": "Binance Futures pump detection bot",
-  "type": "module",
   "scripts": {
     "dev": "tsx watch src/main.ts",
     "build": "tsc",
