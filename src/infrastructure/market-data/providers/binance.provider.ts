@@ -3,18 +3,22 @@ import { Injectable } from '../../../shared/decorators';
 import { Logger } from '../../../shared/logger';
 import {
   IMarketDataProvider,
+  MarketType,
   PriceUpdateCallback,
   PriceUpdateData,
   ProviderHealthStatus,
 } from '../../../domain/interfaces/market-data-provider.interface';
 
 const BINANCE_SPOT_STREAM_URL = 'wss://stream.binance.com:9443/ws/!miniTicker@arr';
+const BINANCE_FUTURES_STREAM_URL = 'wss://fstream.binance.com/ws/!ticker@arr';
 const RECONNECT_DELAY = 5000;
 
 @Injectable()
 export class BinanceMarketDataProvider implements IMarketDataProvider {
-  public readonly providerId = 'binance';
-  private readonly logger = new Logger('BinanceProvider');
+  public readonly providerId: string;
+  public readonly marketType: MarketType;
+  private readonly logger: Logger;
+  private readonly streamUrl: string;
 
   private ws: WebSocket | null = null;
   private connected = false;
@@ -26,18 +30,26 @@ export class BinanceMarketDataProvider implements IMarketDataProvider {
   private reconnectAttempts = 0;
   private lastUpdateTime = 0;
 
+  constructor(marketType: MarketType = 'spot') {
+    this.marketType = marketType;
+    this.providerId = `binance-${marketType}`;
+    this.logger = new Logger(this.providerId);
+    this.streamUrl = marketType === 'futures' ? BINANCE_FUTURES_STREAM_URL : BINANCE_SPOT_STREAM_URL;
+  }
+
   public async connect(): Promise<void> {
     if (this.connected) return;
 
     return new Promise((resolve, reject) => {
       try {
-        this.ws = new WebSocket(BINANCE_SPOT_STREAM_URL);
+        this.logger.info(`Connecting to ${this.streamUrl}...`);
+        this.ws = new WebSocket(this.streamUrl);
 
         this.ws.on('open', () => {
           this.connected = true;
           this.reconnecting = false;
           this.reconnectAttempts = 0;
-          this.logger.info(`${this.providerId}: Connected`);
+          this.logger.info(`Connected to Binance ${this.marketType}`);
           resolve();
         });
 
@@ -47,19 +59,19 @@ export class BinanceMarketDataProvider implements IMarketDataProvider {
             this.handleMessages(messages);
           } catch (error) {
             this.errorCount++;
-            this.logger.error(`${this.providerId}: Parse error`, error);
+            this.logger.error('Parse error:', error);
           }
         });
 
         this.ws.on('error', (error) => {
           this.errorCount++;
-          this.logger.error(`${this.providerId}: WebSocket error`, error);
+          this.logger.error('WebSocket error:', error);
           if (!this.connected) reject(error);
         });
 
         this.ws.on('close', () => {
           this.connected = false;
-          this.logger.warn(`${this.providerId}: Connection closed`);
+          this.logger.warn('Connection closed');
           this.handleReconnection();
         });
       } catch (error) {
@@ -74,7 +86,7 @@ export class BinanceMarketDataProvider implements IMarketDataProvider {
       this.ws.close();
       this.ws = null;
     }
-    this.logger.info(`${this.providerId}: Disconnected`);
+    this.logger.info('Disconnected');
   }
 
   public isConnected(): boolean {
@@ -82,17 +94,15 @@ export class BinanceMarketDataProvider implements IMarketDataProvider {
   }
 
   public async subscribe(symbols: string[]): Promise<void> {
-    // Binance stream already provides all symbols, no action needed
-    this.logger.debug(`${this.providerId}: Subscription not needed (all symbols stream)`);
+    // Binance all-ticker stream doesn't need subscription
+    this.logger.debug('Subscription not needed (all symbols stream)');
   }
 
   public async unsubscribe(symbols: string[]): Promise<void> {
-    // Not applicable for Binance all-symbols stream
+    // Not applicable
   }
 
   public async getAvailableSymbols(): Promise<string[]> {
-    // Would require REST API call to /api/v3/exchangeInfo
-    // For now, return empty array as we get symbols from stream
     return [];
   }
 
@@ -103,6 +113,7 @@ export class BinanceMarketDataProvider implements IMarketDataProvider {
   public getHealthStatus(): ProviderHealthStatus {
     return {
       providerId: this.providerId,
+      marketType: this.marketType,
       isConnected: this.connected,
       lastUpdateTime: this.lastUpdateTime,
       messageCount: this.messageCount,
@@ -117,7 +128,12 @@ export class BinanceMarketDataProvider implements IMarketDataProvider {
     for (const msg of messages) {
       try {
         const symbol = msg.s;
+        
+        // Filter only USDT pairs
         if (!symbol?.endsWith('USDT')) continue;
+        
+        // For futures: exclude quarterly contracts (e.g., BTCUSDT_250328)
+        if (this.marketType === 'futures' && symbol.includes('_')) continue;
 
         const price = parseFloat(msg.c);
         const timestamp = msg.E;
@@ -128,6 +144,7 @@ export class BinanceMarketDataProvider implements IMarketDataProvider {
 
           const data: PriceUpdateData = {
             providerId: this.providerId,
+            marketType: this.marketType,
             symbol,
             price,
             timestamp,
@@ -135,11 +152,17 @@ export class BinanceMarketDataProvider implements IMarketDataProvider {
             quoteVolume: msg.q ? parseFloat(msg.q) : undefined,
           };
 
+          // Futures-specific fields
+          if (this.marketType === 'futures') {
+            data.markPrice = msg.p ? parseFloat(msg.p) : undefined;
+            data.fundingRate = msg.r ? parseFloat(msg.r) : undefined;
+          }
+
           this.callback(data);
         }
       } catch (error) {
         this.errorCount++;
-        this.logger.debug(`${this.providerId}: Message processing error`, error);
+        this.logger.debug('Message processing error:', error);
       }
     }
   }
@@ -149,7 +172,7 @@ export class BinanceMarketDataProvider implements IMarketDataProvider {
 
     this.reconnecting = true;
     this.reconnectAttempts++;
-    this.logger.info(`${this.providerId}: Reconnecting... (attempt ${this.reconnectAttempts})`);
+    this.logger.info(`Reconnecting... (attempt ${this.reconnectAttempts})`);
 
     await this.disconnect();
     await new Promise((resolve) => setTimeout(resolve, RECONNECT_DELAY));
@@ -157,7 +180,7 @@ export class BinanceMarketDataProvider implements IMarketDataProvider {
     try {
       await this.connect();
     } catch (error) {
-      this.logger.error(`${this.providerId}: Reconnection failed`, error);
+      this.logger.error('Reconnection failed:', error);
       this.reconnecting = false;
       this.handleReconnection();
     }

@@ -8,10 +8,13 @@ export class TelegramBotService {
   private bot: TelegramBot;
   private readonly logger = new Logger(TelegramBotService.name);
 
-  // ✅ NEW: Rate limiting for Telegram API (30 messages per second)
+  // Rate limiting for Telegram API (30 messages per second)
   private readonly messageQueue = new Map<number, Array<{ message: string; timestamp: number }>>();
-  private readonly MAX_MESSAGES_PER_SECOND = 25; // Stay below 30 limit
+  private readonly MAX_MESSAGES_PER_SECOND = 25;
   private readonly RATE_LIMIT_WINDOW_MS = 1000;
+
+  // Detect market type from ENV for proper link generation
+  private readonly marketType: string;
 
   constructor(token: string) {
     if (!token) {
@@ -20,7 +23,11 @@ export class TelegramBotService {
     this.bot = new TelegramBot(token, { polling: true });
     this.setupErrorHandling();
 
-    // ✅ NEW: Cleanup old queue entries every minute
+    // Detect primary market type from configuration
+    this.marketType = this.detectMarketType();
+    this.logger.info(`Telegram links configured for: ${this.marketType}`);
+
+    // Cleanup old queue entries every minute
     setInterval(() => this.cleanupQueues(), 60_000);
   }
 
@@ -28,7 +35,6 @@ export class TelegramBotService {
     return this.bot;
   }
 
-  // ✅ FIX: Added rate limiting
   public async sendMessage(chatId: number, message: string): Promise<void> {
     try {
       // Check rate limit
@@ -49,7 +55,6 @@ export class TelegramBotService {
     }
   }
 
-  // ✅ UPDATED: Removed quality parameter and simplified format
   public async sendSignal(
     chatId: number,
     signal: SignalDto,
@@ -59,7 +64,6 @@ export class TelegramBotService {
     await this.sendMessage(chatId, message);
   }
 
-  // ✅ UPDATED: Removed quality indicator, cleaner format
   private formatSignalMessage(signal: SignalDto, triggerIntervalMinutes?: number): string {
     const formatPercent = (value: number): string => {
       const sign = value >= 0 ? '📈' : '📉';
@@ -76,11 +80,10 @@ export class TelegramBotService {
     const prevPriceStr = this.formatPrice(signal.previousPrice);
     const intervalDisplay = triggerIntervalMinutes ? `${triggerIntervalMinutes}m` : '';
 
-    // ✅ FIX: Changed to spot trading links (removed futures)
-    const binanceLink = `https://www.binance.com/ru/trade/${signal.symbol}`;
-    const tradingViewLink = `https://www.tradingview.com/chart/?symbol=BINANCE:${signal.symbol}`;
+    // Generate links based on market type
+    const binanceLink = this.generateBinanceLink(signal.symbol);
+    const tradingViewLink = this.generateTradingViewLink(signal.symbol);
 
-    // ✅ NEW: Minimalist format without quality indicator
     return `
 🚨 №${signal.signalNumber} - <a href="${binanceLink}">${signal.symbol}</a> ${intervalDisplay}
 ${formatPercent(signal.priceChangePercent)} <a href="${tradingViewLink}">Chart</a>
@@ -93,17 +96,65 @@ ${formatPercent(signal.priceChangePercent)} <a href="${tradingViewLink}">Chart</
    */
   private formatPrice(price: number): string {
     if (price >= 1000) {
-      return price.toFixed(2); // $1,234.56
+      return price.toFixed(2);
     } else if (price >= 1) {
-      return price.toFixed(4); // $12.3456
+      return price.toFixed(4);
     } else if (price >= 0.01) {
-      return price.toFixed(4); // $0.1234
+      return price.toFixed(4);
     } else {
-      return price.toFixed(6); // $0.000123
+      return price.toFixed(6);
     }
   }
 
-  // ✅ NEW: Rate limiting implementation
+  /**
+   * Generate Binance link based on market type
+   */
+  private generateBinanceLink(symbol: string): string {
+    if (this.marketType === 'futures') {
+      return `https://www.binance.com/ru/futures/${symbol}`;
+    }
+    return `https://www.binance.com/ru/trade/${symbol}`;
+  }
+
+  /**
+   * Generate TradingView link based on market type
+   */
+  private generateTradingViewLink(symbol: string): string {
+    if (this.marketType === 'futures') {
+      // Perpetual futures suffix
+      return `https://www.tradingview.com/chart/?symbol=BINANCE:${symbol}.P`;
+    }
+    return `https://www.tradingview.com/chart/?symbol=BINANCE:${symbol}`;
+  }
+
+  /**
+   * Detect primary market type from environment configuration
+   */
+  private detectMarketType(): string {
+    // Check inline format first
+    const providers = process.env.MARKET_DATA_PROVIDERS || '';
+    if (providers.includes(':')) {
+      const firstProvider = providers.split(',')[0];
+      const [, marketType] = firstProvider.split(':');
+      if (marketType) return marketType.toLowerCase();
+    }
+
+    // Check specific Binance config
+    const binanceMarketType = process.env.BINANCE_MARKET_TYPE?.toLowerCase();
+    if (binanceMarketType === 'spot' || binanceMarketType === 'futures') {
+      return binanceMarketType;
+    }
+
+    // Check global market type
+    const globalMarketType = process.env.MARKET_TYPE?.toLowerCase();
+    if (globalMarketType === 'spot' || globalMarketType === 'futures') {
+      return globalMarketType;
+    }
+
+    // Default to spot
+    return 'spot';
+  }
+
   private async checkRateLimit(chatId: number): Promise<boolean> {
     const now = Date.now();
     const queue = this.messageQueue.get(chatId) || [];
@@ -125,7 +176,6 @@ ${formatPercent(signal.priceChangePercent)} <a href="${tradingViewLink}">Chart</
     this.messageQueue.set(chatId, queue);
   }
 
-  // ✅ NEW: Cleanup old queue entries
   private cleanupQueues(): void {
     const now = Date.now();
     let cleaned = 0;

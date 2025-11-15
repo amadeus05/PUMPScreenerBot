@@ -3,9 +3,14 @@
  */
 export interface IMarketDataProvider {
     /**
-     * Unique identifier for the provider (e.g., 'binance', 'bybit', 'okx')
+     * Unique identifier for the provider (e.g., 'binance-spot', 'binance-futures', 'bybit-futures')
      */
     readonly providerId: string;
+  
+    /**
+     * Market type (spot or futures)
+     */
+    readonly marketType: MarketType;
   
     /**
      * Establish WebSocket connection to the exchange
@@ -50,22 +55,36 @@ export interface IMarketDataProvider {
     getHealthStatus(): ProviderHealthStatus;
   }
   
+  export type MarketType = 'spot' | 'futures';
+  
   export type PriceUpdateCallback = (data: PriceUpdateData) => void;
   
   export interface PriceUpdateData {
     providerId: string;
+    marketType: MarketType;
     symbol: string;
     price: number;
     timestamp: number;
     volume?: number;
     quoteVolume?: number;
+    markPrice?: number; // Only for futures
+    fundingRate?: number; // Only for futures
   }
   
   export interface ProviderHealthStatus {
     providerId: string;
+    marketType: MarketType;
     isConnected: boolean;
     lastUpdateTime: number;
     messageCount: number;
     reconnectAttempts: number;
     errorCount: number;
+  }
+  
+  /**
+   * Configuration for creating a market data provider
+   */
+  export interface ProviderConfig {
+    exchange: string; // 'binance', 'bybit', 'okx'
+    marketType: MarketType; // 'spot' or 'futures'
   }
