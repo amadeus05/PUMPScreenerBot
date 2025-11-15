@@ -16,6 +16,7 @@
     "class-transformer": "^0.5.1",
     "class-validator": "^0.14.1",
     "dotenv": "^16.4.0",
+    "express": "^5.1.0",
     "node-telegram-bot-api": "^0.64.0",
     "reflect-metadata": "^0.2.2",
     "sqlite3": "^5.1.6",
@@ -27,6 +28,7 @@
     "ws": "^8.17.0"
   },
   "devDependencies": {
+    "@types/express": "^5.0.5",
     "@types/node-telegram-bot-api": "^0.64.0",
     "@types/winston": "^2.4.4",
     "@types/ws": "^8.5.10",
