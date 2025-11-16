@@ -1,4 +1,4 @@
-// Production-Ready Data Aggregator Service v2.3
+// Production-Ready Data Aggregator Service v2.3 (fixed UP/DOWN detection)
 // Features:
 // - Event-time OHLC with out-of-order support
 // - Boundary interpolation (linear, production-grade)
@@ -410,7 +410,6 @@ export class DataAggregatorService implements IDataAggregatorService {
   }
 
   // ==================== CALCULATION WITH STRICT POLICIES ====================
-
   private calculateBuckets(
     symbol: string,
     minutes: number,
@@ -425,20 +424,16 @@ export class DataAggregatorService implements IDataAggregatorService {
 
     const now = Date.now();
     const durationMs = minutes * 60_000;
+    const currentPrice = this.lastKnownPrices.get(symbol);
 
+    if (!currentPrice || currentPrice <= 0) {
+      if (this.DEBUG) this.logger.debug(`❌ No current price for ${symbol}`);
+      return null;
+    }
+
+    // Warmup: require firstSeen >= window
     const firstSeenTs = this.firstSeen.get(symbol) ?? now;
     const hasWallClockHistory = (now - firstSeenTs) >= durationMs;
-
-    const endBucket = Math.floor(now / bucketSize) * bucketSize;
-    const startBucket = Math.floor((now - durationMs) / bucketSize) * bucketSize;
-
-    const expectedBuckets = Math.round((endBucket - startBucket) / bucketSize) + 1;
-    const keys = map.getSortedKeys();
-    const availableBuckets = keys.filter(k => k >= startBucket && k <= endBucket).length;
-    const coveragePercent = expectedBuckets > 0 ? (availableBuckets / expectedBuckets) * 100 : 0;
-
-    const coverageThreshold = this.getCoverageThreshold(minutes);
-    const minBucketsRequired = Math.ceil(minutes * 0.6);
 
     if (!hasWallClockHistory) {
       if (this.DEBUG) {
@@ -447,70 +442,176 @@ export class DataAggregatorService implements IDataAggregatorService {
       this.warmupRejects++;
       return null;
     }
-    
-    if (availableBuckets < minBucketsRequired || coveragePercent < coverageThreshold) {
-      if (this.DEBUG) {
-        this.logger.debug(
-          `Coverage reject: ${symbol} ${minutes}m ` +
-          `avail=${availableBuckets}/${expectedBuckets} ` +
-          `(${coveragePercent.toFixed(1)}%) ` +
-          `min=${minBucketsRequired} thresh=${coverageThreshold}%`
-        );
-      }
-      this.warmupRejects++;
+
+    const windowStart = now - durationMs;
+    const windowEnd = now;
+
+    // Find movements inside the window (single pass O(n))
+    const movement = this.findMovementsWithinWindow(map, windowStart, windowEnd);
+
+    if (!movement) {
+      if (this.DEBUG) this.logger.debug(`No movement found for ${symbol} ${minutes}m`);
       return null;
     }
 
-    const startPrice = this.getPriceAtBoundary(map, startBucket);
-    const endPrice = this.getPriceAtBoundary(map, endBucket);
+    // Choose the dominant movement by absolute percent (for backward compatibility we preserve priceChangePercent)
+    let chosenPercent = 0;
+    let chosenStartPrice = 0;
+    let chosenEndPrice = currentPrice;
+    let chosenDuration = minutes * 60; // fallback
 
-    if (startPrice === null || endPrice === null) {
-      if (this.DEBUG) this.logger.debug(`🔄 Missing boundaries (interpolation failed), trying fallback`);
-      return this.fallbackInterpolation(map, startBucket, endBucket, bucketSize, durationMs, minutes);
-    }
-
-    const minSamples = this.effectiveMinSamples(minutes);
-    const startBucketKey = this.findNearestBucketAtOrBefore(map, startBucket);
-    const endBucketKey = this.findNearestBucketAtOrBefore(map, endBucket);
-
-    const startBucketObj = startBucketKey !== null ? map.get(startBucketKey) : undefined;
-    const endBucketObj = endBucketKey !== null ? map.get(endBucketKey) : undefined;
-
-    if (startBucketObj && endBucketObj) {
-      if (startBucketObj.count < minSamples || endBucketObj.count < minSamples) {
-        if (this.DEBUG) {
-          this.logger.debug(
-            `📊 Insufficient samples: start=${startBucketObj.count} end=${endBucketObj.count} (need ${minSamples})`
-          );
-        }
-        return this.fallbackInterpolation(map, startBucket, endBucket, bucketSize, durationMs, minutes);
+    if (movement.up && movement.down) {
+      if (movement.up.percent >= movement.down.percent) {
+        chosenPercent = movement.up.percent; // positive
+        chosenStartPrice = movement.up.startPrice;
+        chosenEndPrice = movement.up.endPrice;
+        chosenDuration = movement.up.duration;
+      } else {
+        chosenPercent = -movement.down.percent; // negative to signal drop
+        chosenStartPrice = movement.down.startPrice;
+        chosenEndPrice = movement.down.endPrice;
+        chosenDuration = movement.down.duration;
       }
-    }
-
-    if (startPrice <= 0 || endPrice <= 0) {
-      if (this.DEBUG) this.logger.debug(`❌ Invalid interpolated prices at boundaries`);
+    } else if (movement.up) {
+      chosenPercent = movement.up.percent;
+      chosenStartPrice = movement.up.startPrice;
+      chosenEndPrice = movement.up.endPrice;
+      chosenDuration = movement.up.duration;
+    } else if (movement.down) {
+      chosenPercent = -movement.down.percent;
+      chosenStartPrice = movement.down.startPrice;
+      chosenEndPrice = movement.down.endPrice;
+      chosenDuration = movement.down.duration;
+    } else {
       return null;
     }
 
-    const priceChangePercent = Number((((endPrice - startPrice) / startPrice) * 100).toFixed(6));
+    const result: any = {
+      priceChangePercent: Number(chosenPercent.toFixed(6)),
+      currentPrice: chosenEndPrice,
+      previousPrice: chosenStartPrice,
+      timeWindowSeconds: chosenDuration,
 
-    const result: IMetricChanges = {
-      priceChangePercent,
-      currentPrice: endPrice,
-      previousPrice: startPrice,
-      timeWindowSeconds: minutes * 60,
+      // Extended fields for future-proof checks (optional; trigger engine can leverage these)
+      upPercent: movement.up ? movement.up.percent : 0,
+      upStartPrice: movement.up ? movement.up.startPrice : undefined,
+      upEndPrice: movement.up ? movement.up.endPrice : undefined,
+      upDuration: movement.up ? movement.up.duration : undefined,
+
+      downPercent: movement.down ? movement.down.percent : 0,
+      downStartPrice: movement.down ? movement.down.startPrice : undefined,
+      downEndPrice: movement.down ? movement.down.endPrice : undefined,
+      downDuration: movement.down ? movement.down.duration : undefined,
     };
 
     if (this.DEBUG) {
-      this.logger.info(
-        `✅ ${symbol} ${minutes}m: ${priceChangePercent.toFixed(4)}% ` +
-        `(${startPrice.toFixed(6)} → ${endPrice.toFixed(6)}) ` +
-        `coverage=${coveragePercent.toFixed(1)}%`
-      );
+      this.logger.info(`✅ ${symbol} ${minutes}m -> ${result.priceChangePercent}% (up:${result.upPercent}% down:${result.downPercent}%)`);
     }
 
     this.metricsCalculated++;
-    return result;
+    return result as IMetricChanges;
+  }
+
+  // ==================== MOVEMENT FINDERS (UP + DOWN in one pass) ====================
+  private findMovementsWithinWindow(
+    map: SortedBucketMap,
+    windowStartMs: number,
+    windowEndMs: number,
+  ) {
+    const keys = map.getSortedKeys();
+    if (keys.length === 0) return null;
+
+    let minPrice = Infinity;
+    let minTs = 0;
+
+    let maxPrice = -Infinity;
+    let maxTs = 0;
+
+    let bestRise = 0;
+    let bestRiseStart = 0;
+    let bestRiseEnd = 0;
+    let bestRiseStartTs = 0;
+    let bestRiseEndTs = 0;
+
+    let bestDrop = 0;
+    let bestDropStart = 0;
+    let bestDropEnd = 0;
+    let bestDropStartTs = 0;
+    let bestDropEndTs = 0;
+
+    for (let i = 0; i < keys.length; i++) {
+      const bucketTime = keys[i];
+
+      if (bucketTime < windowStartMs) continue;
+      if (bucketTime > windowEndMs) break;
+
+      const b = map.get(bucketTime)!;
+      if (b.count === 0) continue;
+
+      // Use open for a representative "early" price in bucket, but also consider high/low
+      // We'll use bucket.open for ordering and bucket.high/low for extremes
+      const representative = b.open;
+      const high = b.high;
+      const low = b.low;
+      const firstTs = b.firstTs;
+      const lastTs = b.lastTs;
+
+      // --- For UP detection (min -> later price) ---
+      if (low < minPrice) {
+        minPrice = low;
+        minTs = b.firstTs;
+      }
+
+      // Consider high as candidate for ending price
+      if (minPrice < Infinity) {
+        const rise = ((high - minPrice) / minPrice) * 100;
+        if (rise > bestRise) {
+          bestRise = rise;
+          bestRiseStart = minPrice;
+          bestRiseEnd = high;
+          bestRiseStartTs = minTs;
+          bestRiseEndTs = lastTs;
+        }
+      }
+
+      // --- For DOWN detection (max -> later price) ---
+      if (high > maxPrice) {
+        maxPrice = high;
+        maxTs = b.firstTs;
+      }
+
+      if (maxPrice > -Infinity) {
+        const drop = ((maxPrice - low) / maxPrice) * 100;
+        if (drop > bestDrop) {
+          bestDrop = drop;
+          bestDropStart = maxPrice;
+          bestDropEnd = low;
+          bestDropStartTs = maxTs;
+          bestDropEndTs = lastTs;
+        }
+      }
+    }
+
+    const up = bestRise > 0 ? {
+      percent: Number(bestRise.toFixed(6)),
+      startPrice: bestRiseStart,
+      endPrice: bestRiseEnd,
+      duration: Math.max(1, Math.floor((bestRiseEndTs - bestRiseStartTs) / 1000)),
+      startTs: bestRiseStartTs,
+      endTs: bestRiseEndTs,
+    } : null;
+
+    const down = bestDrop > 0 ? {
+      percent: Number(bestDrop.toFixed(6)),
+      startPrice: bestDropStart,
+      endPrice: bestDropEnd,
+      duration: Math.max(1, Math.floor((bestDropEndTs - bestDropStartTs) / 1000)),
+      startTs: bestDropStartTs,
+      endTs: bestDropEndTs,
+    } : null;
+
+    if (!up && !down) return null;
+    return { up, down };
   }
 
   // ==================== BOUNDARY INTERPOLATION HELPERS ====================
