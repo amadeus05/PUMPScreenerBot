@@ -9,7 +9,8 @@ export class TelegramBotService {
   private readonly logger = new Logger(TelegramBotService.name);
 
   // Rate limiting for Telegram API (30 messages per second)
-  private readonly messageQueue = new Map<number, Array<{ message: string; timestamp: number }>>();
+  private readonly messageQueue = new Map<number, Array<{ message: string; timestamp: number }>>()
+;
   private readonly MAX_MESSAGES_PER_SECOND = 25;
   private readonly RATE_LIMIT_WINDOW_MS = 1000;
 
@@ -22,6 +23,7 @@ export class TelegramBotService {
     }
     this.bot = new TelegramBot(token, { polling: true });
     this.setupErrorHandling();
+    this.setBotCommands();
 
     // Detect primary market type from configuration
     this.marketType = this.detectMarketType();
@@ -29,6 +31,23 @@ export class TelegramBotService {
 
     // Cleanup old queue entries every minute
     setInterval(() => this.cleanupQueues(), 60_000);
+  }
+
+  /**
+   * Set up bot commands menu in Telegram
+   */
+  private async setBotCommands(): Promise<void> {
+    try {
+      await this.bot.setMyCommands([
+        { command: 'start', description: '🚀 Начать работу с ботом' },
+        { command: 'add', description: '➕ Создать новый триггер' },
+        { command: 'my_triggers', description: '📋 Показать мои триггеры' },
+        { command: 'uptime', description: '⏱️ Статус и время работы бота' },
+      ]);
+      this.logger.info('Bot commands menu has been set');
+    } catch (error) {
+      this.logger.error('Failed to set bot commands:', error);
+    }
   }
 
   public getBot(): TelegramBot {

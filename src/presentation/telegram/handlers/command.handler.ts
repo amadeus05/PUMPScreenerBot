@@ -36,6 +36,16 @@ export class CommandHandler {
     // ADD: New uptime command
     this.bot.onText(/\/uptime/, this.handleUptime.bind(this));
     this.bot.onText(/\/status/, this.handleUptime.bind(this)); // Alias
+    
+    // Handle keyboard button clicks
+    this.bot.on('message', (msg) => {
+      if (msg.text === '⏱️ Uptime') {
+        this.handleUptime(msg);
+      } else if (msg.text === '📋 My Triggers') {
+        this.handleMyTriggers(msg);
+      }
+    });
+    
     this.bot.on('callback_query', this.handleCallbackQuery.bind(this));
     this.logger.info('Telegram command handlers initialized.');
   }
@@ -82,7 +92,22 @@ export class CommandHandler {
 
 <i>Бот работает уже: ${uptime}</i>
     `.trim();
-    await this.telegramBotService.sendMessage(chatId, welcomeMessage);
+
+    // Add keyboard with quick access buttons
+    const options: TelegramBot.SendMessageOptions = {
+      parse_mode: 'HTML',
+      reply_markup: {
+        keyboard: [
+          [
+            { text: '⏱️ Uptime' },
+            { text: '📋 My Triggers' },
+          ],
+        ],
+        resize_keyboard: true,
+      },
+    };
+
+    await this.bot.sendMessage(chatId, welcomeMessage, options);
   }
 
   private async handleAddTrigger(msg: TelegramBot.Message): Promise<void> {
