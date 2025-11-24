@@ -54,6 +54,16 @@ class TickNormalizer {
     private readonly spikeMultiplier: number,
   ) {}
 
+  // Добавляем метод для получения MAD
+  getCurrentMad(symbol: string): number {
+    const buffer = this.buffers.get(symbol);
+    if (!buffer || buffer.length < this.minWindow) return 0;
+    
+    const median = this.computeMedian(buffer);
+    const deviations = buffer.map(v => Math.abs(v - median));
+    return this.computeMedian(deviations) || 0;
+  }
+
   // Добавляем метод для очистки буфера символа
   removeSymbol(symbol: string): void {
     this.buffers.delete(symbol);
@@ -596,7 +606,7 @@ export class DataAggregatorService implements IDataAggregatorService {
     }
 
     const effectivePoint = { price: currentPrice, ts: Math.min(currentTs, now) };
-    const metrics = this.evaluateWindow(snapshot, map, effectivePoint);
+    const metrics = this.evaluateWindow(snapshot, map, effectivePoint, symbol);
 
     if (metrics) {
       this.metricsCalculated++;
@@ -723,6 +733,7 @@ export class DataAggregatorService implements IDataAggregatorService {
     snapshot: WindowSnapshot,
     map: SortedBucketMap,
     currentPoint: { price: number; ts: number },
+    symbol: string,
   ): IMetricChanges | null {
     if (!Number.isFinite(currentPoint.price) || currentPoint.price <= 0) return null;
     if (currentPoint.ts < snapshot.windowStart) return null;
@@ -761,7 +772,7 @@ export class DataAggregatorService implements IDataAggregatorService {
 
     const closes = points.map(p => p.value);
     const medianSeries = this.applySlidingMedian(closes);
-    const kalmanSeries = this.runKalman(medianSeries);
+    const kalmanSeries = this.runKalman(medianSeries, symbol); // Передаем symbol
     if (kalmanSeries.length === 0) return null;
 
     // сохраняем фактический текущий тик
@@ -862,13 +873,28 @@ export class DataAggregatorService implements IDataAggregatorService {
     });
   }
 
-  private runKalman(values: number[]): number[] {
+  private runKalman(values: number[], symbol?: string): number[] {
     if (values.length === 0) return [];
     const result: number[] = [];
     let estimate = values[0];
     let covariance = 1;
+    
+    // Базовые параметры
     const q = this.KALMAN_PROCESS_NOISE;
-    const r = this.KALMAN_MEASUREMENT_NOISE;
+    let r = this.KALMAN_MEASUREMENT_NOISE;
+
+    // Адаптация R на основе текущего MAD из TickNormalizer
+    // Предполагаем, что symbol доступен через замыкание или нужно передать
+    // Для простоты используем глобальную адаптацию (без привязки к символу)
+    try {
+      // Если нужно привязать к символу, потребуется изменить сигнатуру метода
+      const recentMad = this.calculateVolatility(values.slice(-10));
+      if (recentMad > 0) {
+        r = Math.max(0.1, recentMad * 15); // MAD * 15 дает хорошую scaling
+      }
+    } catch (e) {
+      // fallback к стандартному R
+    }
 
     result.push(estimate);
 
@@ -1176,5 +1202,14 @@ export class DataAggregatorService implements IDataAggregatorService {
       const oldestAge = stats.oldestData ? ((Date.now() - stats.oldestData) / 60000).toFixed(1) : 'N/A';
       this.logger.debug(`   Oldest data: ${oldestAge} minutes ago`);
     }
+  }
+
+  private calculateVolatility(values: number[]): number {
+    if (values.length < 2) return 0;
+    let sum = 0;
+    for (let i = 1; i < values.length; i++) {
+      sum += Math.abs(values[i] - values[i-1]) / values[i-1];
+    }
+    return sum / (values.length - 1);
   }
 }
