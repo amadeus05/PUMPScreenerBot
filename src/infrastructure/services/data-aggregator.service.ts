@@ -828,13 +828,9 @@ export class DataAggregatorService implements IDataAggregatorService {
       : -chosen.movement.percent;
 
     // Вычисляем netChangePercent альтернативным способом если основной не работает
-    let netChangePercent = this.computeNetChange(map, snapshot.windowStart, currentPoint.price);
-    if (netChangePercent === null && snapshot.candles.length > 0) {
-      // Используем изменение от первого доступного бака до текущей цены
-      const firstCandle = snapshot.candles[0];
-      const startPrice = firstCandle.open;
-      netChangePercent = Number((((currentPoint.price - startPrice) / startPrice) * 100).toFixed(6));
-    }
+    let netChangePercent = this.computeRobustNetChange(
+      map, snapshot.windowStart, currentPoint.price, snapshot.candles
+    );
 
     const result: any = {
       priceChangePercent: Number(signedPercent.toFixed(6)),
@@ -938,6 +934,39 @@ export class DataAggregatorService implements IDataAggregatorService {
       return null;
     }
     return Number((((endPrice - startPrice) / startPrice) * 100).toFixed(6));
+  }
+
+  private computeRobustNetChange(
+    map: SortedBucketMap, 
+    windowStart: number, 
+    endPrice: number,
+    fallbackCandles: Bucket[]
+  ): number | null {
+    // Основной метод с интерполяцией
+    const startPrice = this.getPriceAtBoundary(map, windowStart);
+    if (startPrice !== null && startPrice > 0) {
+      return Number((((endPrice - startPrice) / startPrice) * 100).toFixed(6));
+    }
+    
+    // Fallback 1: использовать первый бак с интерполяцией
+    if (fallbackCandles.length > 0) {
+      const firstCandle = fallbackCandles[0];
+      if (firstCandle.firstTs <= windowStart && windowStart <= firstCandle.lastTs) {
+        const interpolated = this.interpolate(
+          firstCandle.firstTs, firstCandle.open,
+          firstCandle.lastTs, firstCandle.close,
+          windowStart
+        );
+        return Number((((endPrice - interpolated) / interpolated) * 100).toFixed(6));
+      }
+    }
+    
+    // Fallback 2: использовать первый available бак
+    if (fallbackCandles.length > 0) {
+      return Number((((endPrice - fallbackCandles[0].open) / fallbackCandles[0].open) * 100).toFixed(6));
+    }
+    
+    return null;
   }
 
   // ==================== BOUNDARY INTERPOLATION HELPERS ====================
