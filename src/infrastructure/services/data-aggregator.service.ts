@@ -1093,9 +1093,14 @@ export class DataAggregatorService implements IDataAggregatorService {
 
     const priceChangePercent = Number((((endPrice - startPrice) / startPrice) * 100).toFixed(6));
 
+    // Вычисляем реальную длительность окна
+    const actualDurationMs = endKey - startKey;
+    const actualWindowSeconds = Math.max(1, Math.floor(actualDurationMs / 1000));
+
     if (this.DEBUG) {
       this.logger.warn(
         `🔄 Fallback used: ${priceChangePercent.toFixed(4)}% ` +
+        `(actual window: ${actualWindowSeconds}s vs expected: ${minutes * 60}s) ` +
         `(${new Date(startKey).toISOString()} → ${new Date(endKey).toISOString()})`
       );
     }
@@ -1104,7 +1109,9 @@ export class DataAggregatorService implements IDataAggregatorService {
       priceChangePercent,
       currentPrice: endPrice,
       previousPrice: startPrice,
-      timeWindowSeconds: minutes * 60,
+      timeWindowSeconds: actualWindowSeconds, // Используем реальную длительность
+      fallbackApplied: true, // Флаг что использован fallback
+      expectedWindowSeconds: minutes * 60, // Ожидаемая длительность для сравнения
     };
   }
 
