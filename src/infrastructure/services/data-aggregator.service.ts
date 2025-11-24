@@ -747,17 +747,25 @@ export class DataAggregatorService implements IDataAggregatorService {
       ts: c.lastTs, // Используем время закрытия бака
     }));
 
-    // Проверяем временную последовательность
-    const lastCandleTs = points[points.length - 1].ts;
-    if (currentPoint.ts <= lastCandleTs) {
-      // Текущая точка раньше или совпадает с последним баком - обновляем последнюю точку
-      points[points.length - 1] = { 
-        value: currentPoint.price, 
-        ts: Math.max(currentPoint.ts, lastCandleTs) // Сохраняем максимальное время
-      };
+    const lastCandleTs = candles.length > 0 ? candles[candles.length - 1].lastTs : snapshot.windowStart;
+
+    // КОРРЕКТНАЯ ОБРАБОТКА ВРЕМЕННЫХ МЕТОК - минимальное искажение
+    let effectiveCurrentTs = currentPoint.ts;
+    if (points.length > 0) {
+      const prevTs = points[points.length - 1].ts;
+      if (effectiveCurrentTs <= prevTs) {
+        effectiveCurrentTs = prevTs + 1; // минимальный шаг +1ms
+        if (this.DEBUG) {
+          this.logger.debug(`Temporal correction: tick ts ${currentPoint.ts} → ${effectiveCurrentTs} (out-of-order)`);
+        }
+      }
+    }
+
+    // Теперь безопасно обновляем или добавляем точку
+    if (points.length > 0 && currentPoint.ts <= lastCandleTs) {
+      points[points.length - 1] = { value: currentPoint.price, ts: effectiveCurrentTs };
     } else {
-      // Текущая точка после последнего бака - добавляем новую точку
-      points.push({ value: currentPoint.price, ts: currentPoint.ts });
+      points.push({ value: currentPoint.price, ts: effectiveCurrentTs });
     }
 
     // Проверяем временную упорядоченность
