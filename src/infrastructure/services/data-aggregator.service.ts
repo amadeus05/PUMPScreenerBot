@@ -24,6 +24,7 @@ type Bucket = {
   count: number;
   firstTs: number;
   lastTs: number;
+  spikeCount: number;
 };
 
 type HealthStats = {
@@ -36,6 +37,59 @@ type HealthStats = {
   warmupRejects: number;
   fallbacksUsed: number;
 };
+
+type NormalizedTick = {
+  price: number;
+  isSpike: boolean;
+  median: number;
+  mad: number;
+};
+
+class TickNormalizer {
+  private readonly buffers = new Map<string, number[]>();
+
+  constructor(
+    private readonly windowSize: number,
+    private readonly minWindow: number,
+    private readonly spikeMultiplier: number,
+  ) {}
+
+  normalize(symbol: string, price: number): NormalizedTick {
+    const buffer = this.buffers.get(symbol) ?? [];
+    buffer.push(price);
+    if (buffer.length > this.windowSize) buffer.shift();
+    this.buffers.set(symbol, buffer);
+
+    if (buffer.length < this.minWindow) {
+      return { price, isSpike: false, median: price, mad: 0 };
+    }
+
+    const median = this.computeMedian(buffer);
+    const deviations = buffer.map(v => Math.abs(v - median));
+    const mad = this.computeMedian(deviations) || 0;
+
+    const epsilon = Math.max(median * 0.0001, 1e-6);
+    const threshold = Math.max(mad * this.spikeMultiplier, epsilon);
+    const deviation = Math.abs(price - median);
+
+    if (deviation > threshold) {
+      const clamped = median + Math.sign(price - median) * threshold;
+      return { price: clamped, isSpike: true, median, mad };
+    }
+
+    return { price, isSpike: false, median, mad };
+  }
+
+  private computeMedian(values: number[]): number {
+    if (values.length === 0) return 0;
+    const sorted = [...values].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    if (sorted.length % 2 === 0) {
+      return (sorted[mid - 1] + sorted[mid]) / 2;
+    }
+    return sorted[mid];
+  }
+}
 
 // Wrapper for Map with cached sorted keys
 class SortedBucketMap {
@@ -94,6 +148,29 @@ class SortedBucketMap {
   }
 }
 
+type WindowSnapshot = {
+  candles: Bucket[];
+  windowStart: number;
+  windowEnd: number;
+  expectedBuckets: number;
+  availableBuckets: number;
+  missingBuckets: number;
+  coveragePercent: number;
+  coveredMs: number;
+  expectedMs: number;
+  spikeShare: number;
+  maxGapMs: number;
+};
+
+type Movement = {
+  percent: number;
+  startPrice: number;
+  endPrice: number;
+  duration: number;
+  startTs: number;
+  endTs: number;
+};
+
 @Injectable()
 export class DataAggregatorService implements IDataAggregatorService {
   private readonly logger = new Logger("DataAggregatorProd");
@@ -116,6 +193,29 @@ export class DataAggregatorService implements IDataAggregatorService {
   private readonly SYMBOL_CHECK_INTERVAL = Number(process.env.SYMBOL_CHECK_INTERVAL) || 5_000;
   private readonly FALLBACK_SHIFT_MULTIPLIER = Number(process.env.FALLBACK_SHIFT_MULTIPLIER) || 2;
   private readonly DEBUG = process.env.DEBUG === 'true';
+
+  // Tick normalization & anti-spike layers
+  private readonly NORMALIZER_WINDOW = Number(process.env.AGG_NORMALIZER_WINDOW) || 25;
+  private readonly NORMALIZER_MIN_WINDOW = Number(process.env.AGG_NORMALIZER_MIN_WINDOW) || 5;
+  private readonly SPIKE_SIGMA_MULTIPLIER = Number(process.env.AGG_SPIKE_SIGMA_MULTIPLIER) || 4;
+  private readonly MEDIAN_FILTER_WINDOW = Number(process.env.AGG_MEDIAN_WINDOW) || 5;
+  private readonly SPIKE_SHARE_LIMIT = Number(process.env.AGG_SPIKE_SHARE_LIMIT) || 0.35;
+  private readonly ACTIVE_BUCKET_GRACE_MS = Number(process.env.AGG_ACTIVE_BUCKET_GRACE_MS) || 5_000;
+  private readonly MAX_GAP_FACTOR = Number(process.env.AGG_MAX_GAP_FACTOR) || 4;
+
+  private readonly tickNormalizer = new TickNormalizer(
+    this.NORMALIZER_WINDOW,
+    this.NORMALIZER_MIN_WINDOW,
+    this.SPIKE_SIGMA_MULTIPLIER,
+  );
+
+  // Параметры фильтра Калмана для сглаживания цены (anti-spike без лага MA)
+  // Чем меньше Q (process noise), тем более "инерционная" модель, тем сильнее сглаживание.
+  // Чем больше R (measurement noise), тем меньше доверие к отдельным измерениям (тикам).
+  private readonly KALMAN_PROCESS_NOISE =
+    Number(process.env.KALMAN_PROCESS_NOISE) || 0.01;
+  private readonly KALMAN_MEASUREMENT_NOISE =
+    Number(process.env.KALMAN_MEASUREMENT_NOISE) || 1.0;
 
   private lastSymbolCheck = 0;
   private readonly SYMBOL_TTL_MS = 24 * 60 * 60 * 1000;
@@ -144,7 +244,10 @@ export class DataAggregatorService implements IDataAggregatorService {
     const maxFuture = Date.now() + 60_000;
     const safeTs = Math.min(Math.floor(timestamp), maxFuture);
 
-    this.lastKnownPrices.set(symbol, price);
+    const normalized = this.tickNormalizer.normalize(symbol, price);
+    const sanitizedPrice = normalized.price;
+
+    this.lastKnownPrices.set(symbol, sanitizedPrice);
     this.lastUpdateTs.set(symbol, safeTs);
 
     if (!this.firstSeen.has(symbol)) {
@@ -152,11 +255,11 @@ export class DataAggregatorService implements IDataAggregatorService {
       if (this.DEBUG) this.logger.debug(`New symbol tracked: ${symbol}`);
     }
 
-    this.addRawPoint(symbol, { timestamp: safeTs, price });
+    this.addRawPoint(symbol, { timestamp: safeTs, price: sanitizedPrice, isSpike: normalized.isSpike });
 
     if (this.triggerEngine && typeof this.triggerEngine.onPriceUpdate === 'function') {
       try {
-        void this.triggerEngine.onPriceUpdate(symbol, price);
+        void this.triggerEngine.onPriceUpdate(symbol, sanitizedPrice);
       } catch (err) {
         this.logger.error(`Trigger engine notification failed: ${err}`);
       }
@@ -225,18 +328,17 @@ export class DataAggregatorService implements IDataAggregatorService {
 
     if (!map) return { availableBuckets: 0, expectedBuckets: 0, coveragePercent: 0, missingBuckets: 0 };
 
-    const now = Date.now();
-    const durationMs = minutes * 60_000;
-    const endBucket = Math.floor(now / bucketSize) * bucketSize;
-    const startBucket = Math.floor((now - durationMs) / bucketSize) * bucketSize;
+    const snapshot = this.buildWindowSnapshot(map, bucketSize, minutes, Date.now());
+    if (!snapshot) {
+      return { availableBuckets: 0, expectedBuckets: 0, coveragePercent: 0, missingBuckets: 0 };
+    }
 
-    const expected = Math.round((endBucket - startBucket) / bucketSize) + 1;
-    const keys = map.getSortedKeys();
-    const available = keys.filter(k => k >= startBucket && k <= endBucket).length;
-    const coverage = expected === 0 ? 0 : Math.round((available / expected) * 100);
-    const missing = expected - available;
-
-    return { availableBuckets: available, expectedBuckets: expected, coveragePercent: coverage, missingBuckets: missing };
+    return {
+      availableBuckets: snapshot.availableBuckets,
+      expectedBuckets: snapshot.expectedBuckets,
+      coveragePercent: snapshot.coveragePercent,
+      missingBuckets: snapshot.missingBuckets,
+    };
   }
 
   public visualizeBuckets(symbol: string): void {
@@ -319,10 +421,10 @@ export class DataAggregatorService implements IDataAggregatorService {
 
   // ==================== INGESTION & BUCKETS ====================
 
-  private addRawPoint(symbol: string, point: { timestamp: number; price: number }): void {
-    const { timestamp: ts, price } = point;
-    this.updateBucket(symbol, ts, price, 15_000, this.buckets15s);
-    this.updateBucket(symbol, ts, price, 60_000, this.buckets1m);
+  private addRawPoint(symbol: string, point: { timestamp: number; price: number; isSpike: boolean }): void {
+    const { timestamp: ts, price, isSpike } = point;
+    this.updateBucket(symbol, ts, price, 15_000, this.buckets15s, isSpike);
+    this.updateBucket(symbol, ts, price, 60_000, this.buckets1m, isSpike);
   }
 
   private updateBucket(
@@ -331,6 +433,7 @@ export class DataAggregatorService implements IDataAggregatorService {
     price: number,
     bucketSize: number,
     store: Map<string, SortedBucketMap>,
+    isSpike: boolean,
   ): void {
     let map = store.get(symbol);
     if (!map) {
@@ -350,6 +453,7 @@ export class DataAggregatorService implements IDataAggregatorService {
         count: 0,
         firstTs: ts,
         lastTs: ts,
+        spikeCount: 0,
       };
       map.set(bucketTime, b);
     }
@@ -371,6 +475,7 @@ export class DataAggregatorService implements IDataAggregatorService {
     b.high = Math.max(b.high, price);
     b.low = Math.min(b.low, price);
     b.count++;
+    if (isSpike) b.spikeCount++;
 
     this.cleanupBuckets(store, symbol, bucketSize);
   }
@@ -398,6 +503,7 @@ export class DataAggregatorService implements IDataAggregatorService {
     }
   }
 
+
   // ==================== DYNAMIC COVERAGE THRESHOLD ====================
 
   private getCoverageThreshold(minutes: number): number {
@@ -424,9 +530,10 @@ export class DataAggregatorService implements IDataAggregatorService {
 
     const now = Date.now();
     const durationMs = minutes * 60_000;
-    const currentPrice = this.lastKnownPrices.get(symbol);
+    const currentPrice = this.lastKnownPrices.get(symbol) ?? 0;
+    const currentTs = this.lastUpdateTs.get(symbol) ?? now;
 
-    if (!currentPrice || currentPrice <= 0) {
+    if (!Number.isFinite(currentPrice) || currentPrice <= 0) {
       if (this.DEBUG) this.logger.debug(`❌ No current price for ${symbol}`);
       return null;
     }
@@ -443,175 +550,339 @@ export class DataAggregatorService implements IDataAggregatorService {
       return null;
     }
 
-    const windowStart = now - durationMs;
-    const windowEnd = now;
-
-    // Find movements inside the window (single pass O(n))
-    const movement = this.findMovementsWithinWindow(map, windowStart, windowEnd);
-
-    if (!movement) {
-      if (this.DEBUG) this.logger.debug(`No movement found for ${symbol} ${minutes}m`);
+    const snapshot = this.buildWindowSnapshot(map, bucketSize, minutes, now);
+    if (!snapshot) {
+      if (this.DEBUG) this.logger.debug(`❌ No closed buckets snapshot for ${symbol} ${minutes}m`);
       return null;
     }
 
-    // Choose the dominant movement by absolute percent (for backward compatibility we preserve priceChangePercent)
-    let chosenPercent = 0;
-    let chosenStartPrice = 0;
-    let chosenEndPrice = currentPrice;
-    let chosenDuration = minutes * 60; // fallback
-
-    if (movement.up && movement.down) {
-      if (movement.up.percent >= movement.down.percent) {
-        chosenPercent = movement.up.percent; // positive
-        chosenStartPrice = movement.up.startPrice;
-        chosenEndPrice = movement.up.endPrice;
-        chosenDuration = movement.up.duration;
-      } else {
-        chosenPercent = -movement.down.percent; // negative to signal drop
-        chosenStartPrice = movement.down.startPrice;
-        chosenEndPrice = movement.down.endPrice;
-        chosenDuration = movement.down.duration;
+    const coverageThreshold = this.getCoverageThreshold(minutes);
+    const minFallbackCoverage = Math.max(30, Math.floor(coverageThreshold * 0.5));
+    if (snapshot.coveragePercent < coverageThreshold) {
+      if (this.DEBUG) {
+        this.logger.debug(`Coverage ${snapshot.coveragePercent}% < ${coverageThreshold}% for ${symbol} ${minutes}m`);
       }
-    } else if (movement.up) {
-      chosenPercent = movement.up.percent;
-      chosenStartPrice = movement.up.startPrice;
-      chosenEndPrice = movement.up.endPrice;
-      chosenDuration = movement.up.duration;
-    } else if (movement.down) {
-      chosenPercent = -movement.down.percent;
-      chosenStartPrice = movement.down.startPrice;
-      chosenEndPrice = movement.down.endPrice;
-      chosenDuration = movement.down.duration;
-    } else {
+      if (snapshot.coveragePercent < minFallbackCoverage) {
+        return this.tryFallback(map, snapshot, bucketSize, durationMs, minutes);
+      }
+      // умеренное покрытие: продолжаем, но сохраняем метку в результате
+    }
+
+    const minSamples = this.effectiveMinSamples(minutes);
+    if (snapshot.candles.length < minSamples) {
+      if (this.DEBUG) {
+        this.logger.debug(`Samples ${snapshot.candles.length}/${minSamples} for ${symbol} ${minutes}m`);
+      }
       return null;
     }
 
-    const result: any = {
-      priceChangePercent: Number(chosenPercent.toFixed(6)),
-      currentPrice: chosenEndPrice,
-      previousPrice: chosenStartPrice,
-      timeWindowSeconds: chosenDuration,
-
-      // Extended fields for future-proof checks (optional; trigger engine can leverage these)
-      upPercent: movement.up ? movement.up.percent : 0,
-      upStartPrice: movement.up ? movement.up.startPrice : undefined,
-      upEndPrice: movement.up ? movement.up.endPrice : undefined,
-      upDuration: movement.up ? movement.up.duration : undefined,
-
-      downPercent: movement.down ? movement.down.percent : 0,
-      downStartPrice: movement.down ? movement.down.startPrice : undefined,
-      downEndPrice: movement.down ? movement.down.endPrice : undefined,
-      downDuration: movement.down ? movement.down.duration : undefined,
-    };
-
-    if (this.DEBUG) {
-      this.logger.info(`✅ ${symbol} ${minutes}m -> ${result.priceChangePercent}% (up:${result.upPercent}% down:${result.downPercent}%)`);
+    if (snapshot.spikeShare > this.SPIKE_SHARE_LIMIT) {
+      if (this.DEBUG) {
+        this.logger.debug(`Spike share ${snapshot.spikeShare.toFixed(3)} > ${this.SPIKE_SHARE_LIMIT} for ${symbol}`);
+      }
+      return null;
     }
 
-    this.metricsCalculated++;
-    return result as IMetricChanges;
+    if (snapshot.maxGapMs > this.MAX_GAP_FACTOR * bucketSize) {
+      if (this.DEBUG) {
+        this.logger.debug(`Gap ${snapshot.maxGapMs}ms > ${this.MAX_GAP_FACTOR}*bucket for ${symbol}`);
+      }
+      return null;
+    }
+
+    const effectivePoint = { price: currentPrice, ts: Math.min(currentTs, now) };
+    const metrics = this.evaluateWindow(snapshot, map, effectivePoint);
+
+    if (metrics) {
+      this.metricsCalculated++;
+      if (this.DEBUG) {
+        this.logger.info(`✅ ${symbol} ${minutes}m -> ${metrics.priceChangePercent}% (cov:${snapshot.coveragePercent}%)`);
+      }
+      return metrics;
+    }
+
+    return this.tryFallback(map, snapshot, bucketSize, durationMs, minutes);
   }
 
-  // ==================== MOVEMENT FINDERS (UP + DOWN in one pass) ====================
-  private findMovementsWithinWindow(
+  private tryFallback(
     map: SortedBucketMap,
-    windowStartMs: number,
-    windowEndMs: number,
-  ) {
+    snapshot: WindowSnapshot,
+    bucketSize: number,
+    durationMs: number,
+    minutes: number,
+  ): IMetricChanges | null {
+    if (!snapshot) return null;
+    const startBucket = Math.floor(snapshot.windowStart / bucketSize) * bucketSize;
+    const endBucket = Math.floor(snapshot.windowEnd / bucketSize) * bucketSize;
+    return this.fallbackInterpolation(
+      map,
+      startBucket,
+      endBucket,
+      bucketSize,
+      durationMs,
+      minutes,
+    );
+  }
+
+  private buildWindowSnapshot(
+    map: SortedBucketMap,
+    bucketSize: number,
+    minutes: number,
+    now: number,
+  ): WindowSnapshot | null {
+    const durationMs = minutes * 60_000;
+    const rawWindowEnd = Math.max(0, now - this.ACTIVE_BUCKET_GRACE_MS);
+    const windowEnd = Math.floor(rawWindowEnd / bucketSize) * bucketSize;
+    if (windowEnd <= 0) return null;
+    const rawWindowStart = windowEnd - durationMs;
+    const windowStart = Math.floor(rawWindowStart / bucketSize) * bucketSize;
+    if (windowEnd <= windowStart) return null;
+
+    const expectedMs = windowEnd - windowStart;
+    if (expectedMs <= 0) return null;
+
     const keys = map.getSortedKeys();
     if (keys.length === 0) return null;
 
-    let minPrice = Infinity;
-    let minTs = 0;
+    const candles: Bucket[] = [];
+    let coveredMs = 0;
+    let totalCount = 0;
+    let totalSpikes = 0;
+    let maxGapMs = 0;
+    let lastCoveredEnd: number | null = null;
 
-    let maxPrice = -Infinity;
-    let maxTs = 0;
+    for (const key of keys) {
+      const bucketStart = key;
+      const bucketEnd = bucketStart + bucketSize;
 
-    let bestRise = 0;
-    let bestRiseStart = 0;
-    let bestRiseEnd = 0;
-    let bestRiseStartTs = 0;
-    let bestRiseEndTs = 0;
+      if (bucketEnd <= windowStart) continue;
+      if (bucketStart >= windowEnd) break;
 
-    let bestDrop = 0;
-    let bestDropStart = 0;
-    let bestDropEnd = 0;
-    let bestDropStartTs = 0;
-    let bestDropEndTs = 0;
+      const bucket = map.get(key);
+      if (!bucket || bucket.count === 0) continue;
 
-    for (let i = 0; i < keys.length; i++) {
-      const bucketTime = keys[i];
-
-      if (bucketTime < windowStartMs) continue;
-      if (bucketTime > windowEndMs) break;
-
-      const b = map.get(bucketTime)!;
-      if (b.count === 0) continue;
-
-      // Use open for a representative "early" price in bucket, but also consider high/low
-      // We'll use bucket.open for ordering and bucket.high/low for extremes
-      const representative = b.open;
-      const high = b.high;
-      const low = b.low;
-      const firstTs = b.firstTs;
-      const lastTs = b.lastTs;
-
-      // --- For UP detection (min -> later price) ---
-      if (low < minPrice) {
-        minPrice = low;
-        minTs = b.firstTs;
+      if (bucketEnd > windowEnd) {
+        // ещё не закрыт
+        continue;
       }
 
-      // Consider high as candidate for ending price
-      if (minPrice < Infinity) {
-        const rise = ((high - minPrice) / minPrice) * 100;
-        if (rise > bestRise) {
-          bestRise = rise;
-          bestRiseStart = minPrice;
-          bestRiseEnd = high;
-          bestRiseStartTs = minTs;
-          bestRiseEndTs = lastTs;
+      candles.push(bucket);
+
+      const overlapStart = Math.max(bucketStart, windowStart);
+      const overlapEnd = Math.min(bucketEnd, windowEnd);
+      if (overlapEnd > overlapStart) coveredMs += overlapEnd - overlapStart;
+
+      totalCount += bucket.count;
+      totalSpikes += bucket.spikeCount;
+
+      if (lastCoveredEnd !== null) {
+        const gap = bucketStart - lastCoveredEnd;
+        if (gap > maxGapMs) maxGapMs = gap;
+      } else {
+        const initialGap = bucketStart - windowStart;
+        if (initialGap > maxGapMs) maxGapMs = initialGap;
+      }
+
+      lastCoveredEnd = bucketEnd;
+    }
+
+    if (!candles.length) return null;
+
+    const trailingGap = windowEnd - (lastCoveredEnd ?? windowStart);
+    if (trailingGap > maxGapMs) maxGapMs = trailingGap;
+
+    const expectedBuckets = Math.max(1, Math.round(expectedMs / bucketSize));
+    const availableBuckets = candles.length;
+    const missingBuckets = Math.max(0, expectedBuckets - availableBuckets);
+    const coveragePercent = expectedMs > 0
+      ? Math.min(100, Math.round((coveredMs / expectedMs) * 100))
+      : 0;
+    const spikeShare = totalCount > 0 ? totalSpikes / totalCount : 0;
+
+    return {
+      candles,
+      windowStart,
+      windowEnd,
+      expectedBuckets,
+      availableBuckets,
+      missingBuckets,
+      coveragePercent,
+      coveredMs,
+      expectedMs,
+      spikeShare,
+      maxGapMs,
+    };
+  }
+
+  private evaluateWindow(
+    snapshot: WindowSnapshot,
+    map: SortedBucketMap,
+    currentPoint: { price: number; ts: number },
+  ): IMetricChanges | null {
+    if (!Number.isFinite(currentPoint.price) || currentPoint.price <= 0) return null;
+    if (currentPoint.ts < snapshot.windowStart) return null;
+
+    const candles = snapshot.candles;
+    if (!candles.length) return null;
+
+    const points: Array<{ value: number; ts: number }> = candles.map(c => ({
+      value: c.close,
+      ts: c.lastTs,
+    }));
+
+    const lastPoint = points[points.length - 1];
+    if (currentPoint.ts >= lastPoint.ts) {
+      points.push({ value: currentPoint.price, ts: currentPoint.ts });
+    } else {
+      points[points.length - 1] = { value: currentPoint.price, ts: Math.max(currentPoint.ts, lastPoint.ts) };
+    }
+
+    if (points.length < 2) return null;
+
+    const closes = points.map(p => p.value);
+    const medianSeries = this.applySlidingMedian(closes);
+    const kalmanSeries = this.runKalman(medianSeries);
+    if (kalmanSeries.length === 0) return null;
+
+    // сохраняем фактический текущий тик
+    kalmanSeries[kalmanSeries.length - 1] = currentPoint.price;
+
+    const currentIdx = kalmanSeries.length - 1;
+    const currentValue = kalmanSeries[currentIdx];
+    const currentTs = points[currentIdx].ts;
+
+    let bestUp: Movement | null = null;
+    let bestDown: Movement | null = null;
+
+    for (let i = 0; i < currentIdx; i++) {
+      const startPrice = kalmanSeries[i];
+      if (!Number.isFinite(startPrice) || startPrice <= 0) continue;
+
+      const change = ((currentValue - startPrice) / startPrice) * 100;
+      const durationSec = Math.max(1, Math.floor((currentTs - points[i].ts) / 1000));
+      if (change >= 0) {
+        const movement: Movement = {
+          percent: Number(change.toFixed(6)),
+          startPrice,
+          endPrice: currentValue,
+          duration: durationSec,
+          startTs: points[i].ts,
+          endTs: currentTs,
+        };
+        if (!bestUp || movement.percent > bestUp.percent) {
+          bestUp = movement;
         }
-      }
-
-      // --- For DOWN detection (max -> later price) ---
-      if (high > maxPrice) {
-        maxPrice = high;
-        maxTs = b.firstTs;
-      }
-
-      if (maxPrice > -Infinity) {
-        const drop = ((maxPrice - low) / maxPrice) * 100;
-        if (drop > bestDrop) {
-          bestDrop = drop;
-          bestDropStart = maxPrice;
-          bestDropEnd = low;
-          bestDropStartTs = maxTs;
-          bestDropEndTs = lastTs;
+      } else {
+        const dropPercent = Number((-change).toFixed(6));
+        const movement: Movement = {
+          percent: dropPercent,
+          startPrice,
+          endPrice: currentValue,
+          duration: durationSec,
+          startTs: points[i].ts,
+          endTs: currentTs,
+        };
+        if (!bestDown || movement.percent > bestDown.percent) {
+          bestDown = movement;
         }
       }
     }
 
-    const up = bestRise > 0 ? {
-      percent: Number(bestRise.toFixed(6)),
-      startPrice: bestRiseStart,
-      endPrice: bestRiseEnd,
-      duration: Math.max(1, Math.floor((bestRiseEndTs - bestRiseStartTs) / 1000)),
-      startTs: bestRiseStartTs,
-      endTs: bestRiseEndTs,
-    } : null;
+    const chosen = this.pickMovement(bestUp, bestDown);
+    if (!chosen) return null;
 
-    const down = bestDrop > 0 ? {
-      percent: Number(bestDrop.toFixed(6)),
-      startPrice: bestDropStart,
-      endPrice: bestDropEnd,
-      duration: Math.max(1, Math.floor((bestDropEndTs - bestDropStartTs) / 1000)),
-      startTs: bestDropStartTs,
-      endTs: bestDropEndTs,
-    } : null;
+    const signedPercent = chosen.direction === 'up'
+      ? chosen.movement.percent
+      : -chosen.movement.percent;
 
-    if (!up && !down) return null;
-    return { up, down };
+    const netChangePercent = this.computeNetChange(map, snapshot.windowStart, currentPoint.price);
+
+    const result: any = {
+      priceChangePercent: Number(signedPercent.toFixed(6)),
+      currentPrice: Number(currentPoint.price.toFixed(8)),
+      previousPrice: Number(chosen.movement.startPrice.toFixed(8)),
+      timeWindowSeconds: chosen.movement.duration,
+      upPercent: bestUp ? bestUp.percent : 0,
+      upStartPrice: bestUp?.startPrice,
+      upEndPrice: bestUp ? currentPoint.price : undefined,
+      upDuration: bestUp?.duration,
+      downPercent: bestDown ? bestDown.percent : 0,
+      downStartPrice: bestDown?.startPrice,
+      downEndPrice: bestDown ? currentPoint.price : undefined,
+      downDuration: bestDown?.duration,
+      netChangePercent: netChangePercent ?? Number(signedPercent.toFixed(6)),
+      coveragePercent: snapshot.coveragePercent,
+      availableBuckets: snapshot.availableBuckets,
+      expectedBuckets: snapshot.expectedBuckets,
+      spikeShare: Number(snapshot.spikeShare.toFixed(4)),
+      maxGapMs: snapshot.maxGapMs,
+      windowStartTs: snapshot.windowStart,
+      windowEndTs: snapshot.windowEnd,
+    };
+
+    return result as IMetricChanges;
+  }
+
+  private applySlidingMedian(series: number[]): number[] {
+    if (series.length === 0) return [];
+    const window = Math.max(1, this.MEDIAN_FILTER_WINDOW);
+    const buffer: number[] = [];
+    return series.map(value => {
+      buffer.push(value);
+      if (buffer.length > window) buffer.shift();
+      return this.computeMedian(buffer);
+    });
+  }
+
+  private runKalman(values: number[]): number[] {
+    if (values.length === 0) return [];
+    const result: number[] = [];
+    let estimate = values[0];
+    let covariance = 1;
+    const q = this.KALMAN_PROCESS_NOISE;
+    const r = this.KALMAN_MEASUREMENT_NOISE;
+
+    result.push(estimate);
+
+    for (let i = 1; i < values.length; i++) {
+      const measurement = Number.isFinite(values[i]) ? values[i] : estimate;
+      covariance = covariance + q;
+      const gain = covariance / (covariance + r);
+      estimate = estimate + gain * (measurement - estimate);
+      covariance = (1 - gain) * covariance;
+      result.push(estimate);
+    }
+
+    return result;
+  }
+
+  private pickMovement(up: Movement | null, down: Movement | null): { direction: 'up' | 'down'; movement: Movement } | null {
+    if (up && down) {
+      return up.percent >= down.percent
+        ? { direction: 'up', movement: up }
+        : { direction: 'down', movement: down };
+    }
+    if (up) return { direction: 'up', movement: up };
+    if (down) return { direction: 'down', movement: down };
+    return null;
+  }
+
+  private computeMedian(values: number[]): number {
+    if (values.length === 0) return 0;
+    const sorted = [...values].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    if (sorted.length % 2 === 0) {
+      return (sorted[mid - 1] + sorted[mid]) / 2;
+    }
+    return sorted[mid];
+  }
+
+  private computeNetChange(map: SortedBucketMap, windowStart: number, endPrice: number): number | null {
+    const startPrice = this.getPriceAtBoundary(map, windowStart);
+    if (startPrice === null || startPrice <= 0 || !Number.isFinite(endPrice) || endPrice <= 0) {
+      return null;
+    }
+    return Number((((endPrice - startPrice) / startPrice) * 100).toFixed(6));
   }
 
   // ==================== BOUNDARY INTERPOLATION HELPERS ====================
