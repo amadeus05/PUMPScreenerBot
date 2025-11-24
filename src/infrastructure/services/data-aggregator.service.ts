@@ -54,6 +54,11 @@ class TickNormalizer {
     private readonly spikeMultiplier: number,
   ) {}
 
+  // Добавляем метод для очистки буфера символа
+  removeSymbol(symbol: string): void {
+    this.buffers.delete(symbol);
+  }
+
   normalize(symbol: string, price: number): NormalizedTick {
     const buffer = this.buffers.get(symbol) ?? [];
     buffer.push(price);
@@ -725,16 +730,31 @@ export class DataAggregatorService implements IDataAggregatorService {
     const candles = snapshot.candles;
     if (!candles.length) return null;
 
+    // Создаем точки с согласованными временными метками
     const points: Array<{ value: number; ts: number }> = candles.map(c => ({
       value: c.close,
-      ts: c.lastTs,
+      ts: c.lastTs, // Используем время закрытия бака
     }));
 
-    const lastPoint = points[points.length - 1];
-    if (currentPoint.ts >= lastPoint.ts) {
-      points.push({ value: currentPoint.price, ts: currentPoint.ts });
+    // Проверяем временную последовательность
+    const lastCandleTs = points[points.length - 1].ts;
+    if (currentPoint.ts <= lastCandleTs) {
+      // Текущая точка раньше или совпадает с последним баком - обновляем последнюю точку
+      points[points.length - 1] = { 
+        value: currentPoint.price, 
+        ts: Math.max(currentPoint.ts, lastCandleTs) // Сохраняем максимальное время
+      };
     } else {
-      points[points.length - 1] = { value: currentPoint.price, ts: Math.max(currentPoint.ts, lastPoint.ts) };
+      // Текущая точка после последнего бака - добавляем новую точку
+      points.push({ value: currentPoint.price, ts: currentPoint.ts });
+    }
+
+    // Проверяем временную упорядоченность
+    for (let i = 1; i < points.length; i++) {
+      if (points[i].ts < points[i-1].ts) {
+        if (this.DEBUG) this.logger.debug(`Temporal inconsistency detected`);
+        return null;
+      }
     }
 
     if (points.length < 2) return null;
@@ -745,7 +765,7 @@ export class DataAggregatorService implements IDataAggregatorService {
     if (kalmanSeries.length === 0) return null;
 
     // сохраняем фактический текущий тик
-    kalmanSeries[kalmanSeries.length - 1] = currentPoint.price;
+    // kalmanSeries[kalmanSeries.length - 1] = currentPoint.price;
 
     const currentIdx = kalmanSeries.length - 1;
     const currentValue = kalmanSeries[currentIdx];
@@ -759,7 +779,8 @@ export class DataAggregatorService implements IDataAggregatorService {
       if (!Number.isFinite(startPrice) || startPrice <= 0) continue;
 
       const change = ((currentValue - startPrice) / startPrice) * 100;
-      const durationSec = Math.max(1, Math.floor((currentTs - points[i].ts) / 1000));
+      // Используем временные метки из points, которые теперь согласованы
+      const durationSec = Math.max(1, Math.floor((points[currentIdx].ts - points[i].ts) / 1000));
       if (change >= 0) {
         const movement: Movement = {
           percent: Number(change.toFixed(6)),
@@ -795,7 +816,14 @@ export class DataAggregatorService implements IDataAggregatorService {
       ? chosen.movement.percent
       : -chosen.movement.percent;
 
-    const netChangePercent = this.computeNetChange(map, snapshot.windowStart, currentPoint.price);
+    // Вычисляем netChangePercent альтернативным способом если основной не работает
+    let netChangePercent = this.computeNetChange(map, snapshot.windowStart, currentPoint.price);
+    if (netChangePercent === null && snapshot.candles.length > 0) {
+      // Используем изменение от первого доступного бака до текущей цены
+      const firstCandle = snapshot.candles[0];
+      const startPrice = firstCandle.open;
+      netChangePercent = Number((((currentPoint.price - startPrice) / startPrice) * 100).toFixed(6));
+    }
 
     const result: any = {
       priceChangePercent: Number(signedPercent.toFixed(6)),
@@ -810,7 +838,7 @@ export class DataAggregatorService implements IDataAggregatorService {
       downStartPrice: bestDown?.startPrice,
       downEndPrice: bestDown ? currentPoint.price : undefined,
       downDuration: bestDown?.duration,
-      netChangePercent: netChangePercent ?? Number(signedPercent.toFixed(6)),
+      netChangePercent: netChangePercent,
       coveragePercent: snapshot.coveragePercent,
       availableBuckets: snapshot.availableBuckets,
       expectedBuckets: snapshot.expectedBuckets,
@@ -858,7 +886,8 @@ export class DataAggregatorService implements IDataAggregatorService {
 
   private pickMovement(up: Movement | null, down: Movement | null): { direction: 'up' | 'down'; movement: Movement } | null {
     if (up && down) {
-      return up.percent >= down.percent
+      // Сравниваем абсолютные величины изменений, а не просто проценты
+      return Math.abs(up.percent) >= Math.abs(down.percent)
         ? { direction: 'up', movement: up }
         : { direction: 'down', movement: down };
     }
@@ -1120,6 +1149,8 @@ export class DataAggregatorService implements IDataAggregatorService {
     this.lastUpdateTs.delete(symbol);
     this.firstSeen.delete(symbol);
     this.outOfOrderCount.delete(symbol);
+    // Очищаем буфер в TickNormalizer
+    this.tickNormalizer.removeSymbol(symbol);
   }
 
   // ==================== MONITORING ====================
