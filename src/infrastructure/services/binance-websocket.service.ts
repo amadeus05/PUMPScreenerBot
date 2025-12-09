@@ -6,17 +6,29 @@ import {
 } from '../../domain/interfaces/services.interface';
 import { Logger } from '../../shared/logger';
 
-const SPOT_STREAM_URL = 'wss://stream.binance.com:9443/ws/!miniTicker@arr';
+const FUTURES_STREAM_URL = 'wss://fstream.binance.com/ws/!miniTicker@arr';
 const RECONNECT_DELAY = 5000;
+
+// Описываем интерфейс входящего сообщения от Binance MiniTicker
+// Документация: https://binance-docs.github.io/apidocs/futures/en/#individual-symbol-mini-ticker-streams
+interface IBinanceMiniTicker {
+  e: string; // Event type (например, "24hrMiniTicker")
+  E: number; // Event time
+  s: string; // Symbol (например, "BTCUSDT")
+  c: string; // Close price (Внимание: приходит как строка!)
+  o: string; // Open price
+  h: string; // High price
+  l: string; // Low price
+  v: string; // Total traded base asset volume
+  q: string; // Total traded quote asset volume
+}
 
 @Injectable()
 export class BinanceWebSocketService implements IMarketDataGateway {
   private readonly logger = new Logger(BinanceWebSocketService.name);
-  private spotWs: WebSocket | null = null;
+  private futuresWs: WebSocket | null = null;
   private isConnected = false;
   private isReconnecting = false;
-
-  // ADD: Missing property for message counting
   private messageCount = 0;
 
   constructor(
@@ -28,77 +40,92 @@ export class BinanceWebSocketService implements IMarketDataGateway {
     if (this.isConnected) return;
 
     try {
-      await this.connectToSpotStream();
+      await this.connectToFuturesStream();
       this.isConnected = true;
-      this.logger.info('WebSocket connection established');
-    } catch (error) {
-      this.logger.error('Failed to establish WebSocket connection:', error);
+      this.logger.info('WebSocket connection established (Futures)');
+    } catch (error: unknown) {
+      // Типизируем ошибку как unknown и приводим к строке или Error при логировании
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      this.logger.error(`Failed to establish WebSocket connection: ${errorMessage}`);
       throw error;
     }
   }
 
   public async disconnect(): Promise<void> {
     this.isConnected = false;
-    if (this.spotWs) {
-      this.spotWs.close();
-      this.spotWs = null;
+    if (this.futuresWs) {
+      this.futuresWs.close();
+      this.futuresWs = null;
     }
     this.logger.info('WebSocket connection closed');
   }
 
-  private async connectToSpotStream(): Promise<void> {
+  private async connectToFuturesStream(): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.spotWs = new WebSocket(SPOT_STREAM_URL);
+      this.futuresWs = new WebSocket(FUTURES_STREAM_URL);
 
-      this.spotWs.on('open', () => {
-        this.logger.info('Spot WebSocket connection opened');
+      this.futuresWs.on('open', () => {
+        this.logger.info('Futures WebSocket connection opened');
         resolve();
       });
 
-      this.spotWs.on('message', (data: WebSocket.Data) => {
+      this.futuresWs.on('message', (data: WebSocket.Data) => {
         try {
-          const messages = JSON.parse(data.toString());
-          this.handleSpotMessages(messages);
-        } catch (error) {
-          this.logger.error('Error parsing WebSocket message:', error);
+          // Явное приведение типа после парсинга
+          const parsedData = JSON.parse(data.toString());
+          
+          // Проверка, что это массив (так как мы слушаем @arr стрим)
+          if (Array.isArray(parsedData)) {
+            // Утверждаем тип как массив тикеров
+            this.handleMessages(parsedData as IBinanceMiniTicker[]);
+          }
+        } catch (error: unknown) {
+           const errorMessage = error instanceof Error ? error.message : String(error);
+           this.logger.error(`Error parsing WebSocket message: ${errorMessage}`);
         }
       });
 
-      this.spotWs.on('error', (error) => {
-        this.logger.error('WebSocket error:', error);
+      this.futuresWs.on('error', (error: Error) => {
+        this.logger.error(`WebSocket error: ${error.message}`);
         reject(error);
       });
 
-      this.spotWs.on('close', () => {
+      this.futuresWs.on('close', () => {
         this.logger.warn('WebSocket closed');
         this.handleReconnection();
       });
     });
   }
 
-  private handleSpotMessages(messages: any[]): void {
+  // Аргумент теперь строго типизирован
+  private handleMessages(messages: IBinanceMiniTicker[]): void {
     for (const message of messages) {
       try {
         const symbol = message.s;
 
+        // Фильтрация только USDT пар
         if (!symbol.endsWith('USDT')) continue;
 
+        // Преобразование строки в число
         const price = parseFloat(message.c);
         const timestamp = message.E;
 
-        if (symbol && price > 0) {
-          // ADD: Periodic status log (every 1000 messages to avoid spam)
+        // Проверка на NaN и валидность данных
+        if (symbol && !isNaN(price) && price > 0) {
           this.messageCount = (this.messageCount || 0) + 1;
+          
           if (this.messageCount % 1000 === 0) {
             this.logger.debug(
-              `📈 Processed ${this.messageCount} price updates, active symbols: ${this.dataAggregator.getAllKnownSymbols().length}`,
+              `📈 Processed ${this.messageCount} futures price updates, active symbols: ${this.dataAggregator.getAllKnownSymbols().length}`,
             );
           }
 
           this.dataAggregator.updatePrice(symbol, price, timestamp);
         }
-      } catch (error) {
-        this.logger.debug('Error processing message:', error);
+      } catch (error: unknown) {
+         // В цикле лучше не спамить логами, но если нужно - используем debug
+         // const errorMessage = error instanceof Error ? error.message : String(error);
+         // this.logger.debug(`Error processing specific message: ${errorMessage}`);
       }
     }
   }
@@ -107,7 +134,7 @@ export class BinanceWebSocketService implements IMarketDataGateway {
     if (this.isReconnecting || !this.isConnected) return;
 
     this.isReconnecting = true;
-    this.logger.info('Reconnecting...');
+    this.logger.info('Reconnecting to Futures...');
 
     await this.disconnect();
     await new Promise((resolve) => setTimeout(resolve, RECONNECT_DELAY));
@@ -115,9 +142,13 @@ export class BinanceWebSocketService implements IMarketDataGateway {
     try {
       await this.connect();
       this.isReconnecting = false;
-    } catch (error) {
-      this.logger.error('Reconnection failed:', error);
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      this.logger.error(`Reconnection failed: ${errorMessage}`);
+      
       this.isReconnecting = false;
+      // Рекурсивный вызов с задержкой через setTimeout чтобы не переполнить стек, 
+      // но в данном паттерне async/await это допустимо, если есть внешний контроль
       this.handleReconnection();
     }
   }
