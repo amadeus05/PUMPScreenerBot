@@ -9,42 +9,40 @@ import { Trigger } from '../../domain/entities/trigger.entity';
 import { Logger } from '../../shared/logger';
 import { UptimeService } from './uptime.service';
 
-// Backwards-compatible TriggerEngineService with optimisations:
-// - batched symbol processing (queue with debounce)
-// - grouping triggers by symbol (per-symbol and global triggers)
-// - per-(trigger,symbol) rate-limiting with dynamic backoff
-// - metric caching with price-based invalidation tuned to trigger threshold
-// - separate cooldown for notifications to avoid duplicates
-// - concurrency protection for same trigger+symbol
-// - debug logging behind env flag
-
 const BATCH_PROCESSING_SIZE = Number(process.env.BATCH_PROCESSING_SIZE) || 10;
-const PENDING_FLUSH_MS = Number(process.env.TRIGGER_ENGINE_FLUSH_MS) || 200; // flush pending symbols every X ms
-const METRIC_CACHE_TTL_MS = Number(process.env.TRIGGER_ENGINE_METRIC_CACHE_TTL_MS) || 500; // short local cache
-const DEFAULT_MIN_CHECK_INTERVAL_MS = Number(process.env.MIN_CHECK_INTERVAL_MS) || 1000; // base rate-limit
+const PENDING_FLUSH_MS = Number(process.env.TRIGGER_ENGINE_FLUSH_MS) || 200;
+const METRIC_CACHE_TTL_MS = Number(process.env.TRIGGER_ENGINE_METRIC_CACHE_TTL_MS) || 500;
+const DEFAULT_MIN_CHECK_INTERVAL_MS = Number(process.env.MIN_CHECK_INTERVAL_MS) || 1000;
+
+// 🔥 КОНСТАНТА ОТКАТА (0.5%)
+// Сигнал сработает, если цена откатит на 0.5% от пика после пробития триггера
+const REVERSION_DROP_THRESHOLD = 0.005; 
 
 @Injectable()
 export class TriggerEngineService implements ITriggerEngineService {
   private readonly logger = new Logger(TriggerEngineService.name);
   private isRunning = false;
 
-  // pendingSymbols stores last price and timestamp to allow price-aware cache invalidation
+  // Очередь обновлений цен
   private pendingSymbols = new Map<string, { price: number; timestamp: number }>();
 
-  // timing and state maps
-  private lastCheckTime = new Map<string, number>(); // last attempt time for check (per trigger+symbol)
-  private lastNotificationTime = new Map<string, number>(); // last notification time (per trigger+symbol)
-  private runningChecks = new Set<string>(); // currently running checks keys
-  private consecutiveFires = new Map<string, number>(); // consecutive fire counts
+  // Карты состояний и таймингов
+  private lastCheckTime = new Map<string, number>();
+  private lastNotificationTime = new Map<string, number>();
+  private runningChecks = new Set<string>();
+  private consecutiveFires = new Map<string, number>();
 
-  // metric local cache: `${symbol}_${interval}` -> { ts, metrics }
+  // 🔥 STATE MACHINE: Хранилище для отслеживания пиков (Mean Reversion)
+  // Key: `${trigger.id}-${symbol}` -> Value: { peakPrice: number, armedAt: number }
+  private pendingReversions = new Map<string, { peakPrice: number; armedAt: number }>();
+
+  // Кэш метрик агрегатора
   private metricCache = new Map<string, { ts: number; metrics: any }>();
 
   private pendingTimer: NodeJS.Timeout | null = null;
   private healthTimer: NodeJS.Timeout | null = null;
   private cleanupTimer: NodeJS.Timeout | null = null;
 
-  // configuration knobs
   private readonly MIN_CHECK_INTERVAL_MS = DEFAULT_MIN_CHECK_INTERVAL_MS;
   private readonly DEBOUNCE_THRESHOLD = Number(process.env.TRIGGER_ENGINE_DEBOUNCE_THRESHOLD) || 3;
 
@@ -59,28 +57,18 @@ export class TriggerEngineService implements ITriggerEngineService {
     if (this.isRunning) return;
     this.isRunning = true;
 
-    // schedule health-checks and cleanup only after explicit start (better for DI & tests)
     this.healthTimer = setInterval(() => this.logHealth(), 5 * 60 * 1000);
     this.cleanupTimer = setInterval(() => this.cleanupFireCounters(), 10 * 60 * 1000);
 
-    this.logger.info('TriggerEngineService started');
+    this.logger.info('TriggerEngineService started (with Mean Reversion Logic)');
   }
 
   public stop(): void {
     this.isRunning = false;
 
-    if (this.pendingTimer) {
-      clearTimeout(this.pendingTimer);
-      this.pendingTimer = null;
-    }
-    if (this.healthTimer) {
-      clearInterval(this.healthTimer);
-      this.healthTimer = null;
-    }
-    if (this.cleanupTimer) {
-      clearInterval(this.cleanupTimer);
-      this.cleanupTimer = null;
-    }
+    if (this.pendingTimer) { clearTimeout(this.pendingTimer); this.pendingTimer = null; }
+    if (this.healthTimer) { clearInterval(this.healthTimer); this.healthTimer = null; }
+    if (this.cleanupTimer) { clearInterval(this.cleanupTimer); this.cleanupTimer = null; }
 
     this.pendingSymbols.clear();
     this.lastCheckTime.clear();
@@ -88,11 +76,11 @@ export class TriggerEngineService implements ITriggerEngineService {
     this.runningChecks.clear();
     this.consecutiveFires.clear();
     this.metricCache.clear();
+    this.pendingReversions.clear(); // Очистка состояний реверсии
 
     this.logger.info('TriggerEngineService stopped');
   }
 
-  // Called by DataAggregator on each tick. We only store latest price and batch-process.
   public async onPriceUpdate(symbol: string, price: number): Promise<void> {
     if (!this.isRunning || !symbol) return;
 
@@ -103,14 +91,12 @@ export class TriggerEngineService implements ITriggerEngineService {
     }
   }
 
-  // Flush a batch of pending symbols and evaluate triggers for them
   private async flushPendingSymbols(): Promise<void> {
     if (!this.isRunning) return;
 
     const work = Array.from(this.pendingSymbols.entries()).slice(0, BATCH_PROCESSING_SIZE);
     for (const [symbol] of work) this.pendingSymbols.delete(symbol);
 
-    // rearm timer if still pending
     if (this.pendingSymbols.size === 0 && this.pendingTimer) {
       clearTimeout(this.pendingTimer);
       this.pendingTimer = null;
@@ -121,17 +107,14 @@ export class TriggerEngineService implements ITriggerEngineService {
 
     if (work.length === 0) return;
 
-    // load active triggers once per flush to reduce repository hits
     const activeTriggers = this.triggerRepository.getAllActive();
     if (!activeTriggers || activeTriggers.length === 0) return;
 
-    // group and sort triggers
     const triggersBySymbol = this.groupAndSortTriggers(activeTriggers);
 
-    // iterate symbols; processing them sequentially improves metric cache hit-rate
     for (const [symbol, { price: currentPrice }] of work) {
       try {
-        // skip if aggregator considers symbol cold (optional helper)
+        // Проверка "прогрева" агрегатора (опционально)
         // @ts-ignore
         if (typeof (this.dataAggregator as any).isWarm === 'function') {
           // @ts-ignore
@@ -146,7 +129,7 @@ export class TriggerEngineService implements ITriggerEngineService {
           try {
             await this.checkTriggerWithRateLimit(trigger, symbol, currentPrice);
           } catch (err) {
-            this.logger.error(`checkTriggerWithRateLimit error for ${symbol} / trigger ${trigger.id}:`, err);
+            this.logger.error(`checkTrigger error for ${symbol}:`, err);
           }
         }
       } catch (err) {
@@ -155,23 +138,17 @@ export class TriggerEngineService implements ITriggerEngineService {
     }
   }
 
-  // Group triggers by symbol key and sort each group by priority (higher threshold first)
   private groupAndSortTriggers(triggers: Trigger[]): Map<string, Trigger[]> {
     const result = new Map<string, Trigger[]>();
-
-    // Trigger has no symbol field → all triggers are global
-    const key = '*';
+    const key = '*'; 
     const arr: Trigger[] = [];
     for (const t of triggers) arr.push(t);
-
-    // sort by threshold
+    // Сортировка по величине изменения (сначала самые большие движения)
     arr.sort((a, b) => (b.priceChangePercent ?? 0) - (a.priceChangePercent ?? 0));
     result.set(key, arr);
-
     return result;
   }
 
-  // Rate-limit wrapper: avoids frequent checks and concurrent checks for same trigger+symbol
   private async checkTriggerWithRateLimit(trigger: Trigger, symbol: string, currentPrice: number): Promise<void> {
     const checkKey = `${trigger.id}-${symbol}`;
     const now = Date.now();
@@ -193,20 +170,21 @@ export class TriggerEngineService implements ITriggerEngineService {
     }
   }
 
-  // Main check logic. Accepts latest currentPrice to allow price-aware decisions.
+  // =================================================================
+  // 🔥 ГЛАВНАЯ ЛОГИКА ПРОВЕРКИ ТРИГГЕРА + MEAN REVERSION
+  // =================================================================
   private async checkTrigger(trigger: Trigger, symbol: string, currentPrice: number): Promise<void> {
     const checkKey = `${trigger.id}-${symbol}`;
 
     try {
+      // 1. Получение метрик (с кэшированием)
       const metricKey = `${symbol}_${trigger.timeIntervalMinutes}`;
       const cached = this.metricCache.get(metricKey);
       let metrics: any = null;
 
-      // Dynamic invalidation: if cached exists and price moved significantly vs trigger threshold
       const thresholdPercent = Math.abs(trigger.priceChangePercent || 0);
-      // fallback to 1% if threshold is missing or tiny
       const effectiveThreshold = Math.max(thresholdPercent, 1);
-      const invalidateLevel = Math.max(effectiveThreshold / 200, 0.005); // half of threshold (%) divided by 100
+      const invalidateLevel = Math.max(effectiveThreshold / 200, 0.005);
 
       const shouldInvalidateCache = !!cached &&
         Number.isFinite(cached.metrics?.currentPrice) &&
@@ -216,61 +194,142 @@ export class TriggerEngineService implements ITriggerEngineService {
         metrics = cached.metrics;
       } else {
         metrics = await this.dataAggregator.getMetricChanges(symbol, trigger.timeIntervalMinutes);
-        // ensure metrics has currentPrice (prefer newest tick)
         if (!metrics) {
           this.metricCache.set(metricKey, { ts: Date.now(), metrics: null });
         } else {
-          metrics.currentPrice = currentPrice;
+          metrics.currentPrice = currentPrice; // Force latest price
           this.metricCache.set(metricKey, { ts: Date.now(), metrics });
         }
       }
 
       if (!metrics) {
-        // no data => reset consecutive fires
+        // Данных нет — сбрасываем всё
         this.consecutiveFires.delete(checkKey);
-        if (this.isDebug()) this.logger.debug(`No metrics for ${symbol}@${trigger.timeIntervalMinutes}m`);
+        this.pendingReversions.delete(checkKey);
         return;
       }
 
-      if (this.isDebug()) {
-        const pct = Number.isFinite(metrics.priceChangePercent) ? metrics.priceChangePercent.toFixed(2) : 'NaN';
-        this.logger.debug(`Eval trigger=${trigger.id} symbol=${symbol} interval=${trigger.timeIntervalMinutes}m actual=${pct}% currentPrice=${metrics.currentPrice}`);
-      }
+      // 2. Проверяем, пробит ли основной порог (например, > 8%)
+      const isThresholdMet = this.shouldTriggerFire(trigger, metrics);
 
-      if (this.shouldTriggerFire(trigger, metrics)) {
-        const prev = this.consecutiveFires.get(checkKey) || 0;
-        const nowCount = prev + 1;
-        this.consecutiveFires.set(checkKey, nowCount);
+      // ===========================================
+      // 🕵️‍♂️ LOGIC: MEAN REVERSION (PULLBACK)
+      // ===========================================
+      
+      // Логика запускается если порог пробит ИЛИ мы уже "на мушке"
+      if (isThresholdMet || this.pendingReversions.has(checkKey)) {
+        
+        let reversionState = this.pendingReversions.get(checkKey);
 
-        this.logger.info(`Trigger ${trigger.id} fired for ${symbol} (count=${nowCount})`);
+        // A. Сценарий СБРОСА: Цена упала ниже порога срабатывания, так и не дав откат
+        // Пример: Было +8.1%, стало +7.5% (порог 8%). Мы больше не ждем пика.
+        if (!isThresholdMet && reversionState) {
+            const threshold = Number(trigger.priceChangePercent) || 0;
+            
+            // Проверка для UP триггера
+            if (trigger.direction === 'up' && metrics.priceChangePercent < threshold) {
+                 if (this.isDebug()) this.logger.debug(`Reset reversion for ${symbol}: price dropped below threshold`);
+                 this.pendingReversions.delete(checkKey);
+                 return; // Выход без сигнала
+            }
+             // Проверка для DOWN триггера
+            if (trigger.direction === 'down' && metrics.priceChangePercent > -Math.abs(threshold)) {
+                 this.pendingReversions.delete(checkKey);
+                 return; // Выход без сигнала
+            }
+        }
 
-        // notification cooldown: don't notify more often than notificationLimitSeconds
-        const notifKey = `${trigger.id}_${symbol}`;
-        const lastNotified = this.lastNotificationTime.get(notifKey) || 0;
-        const cooldownMs = (trigger.notificationLimitSeconds || 0) * 1000;
-        const now = Date.now();
+        // B. Сценарий ВЗВОДА (ARMING): Первый раз пробили порог
+        if (!reversionState && isThresholdMet) {
+            this.pendingReversions.set(checkKey, { 
+                peakPrice: currentPrice, 
+                armedAt: Date.now() 
+            });
+            if (this.isDebug()) this.logger.debug(`🔫 ARMED Reversion for ${symbol} at ${currentPrice}`);
+            return; // 🛑 СТОП! Ждем следующего тика для подтверждения пика.
+        }
 
-        if (cooldownMs > 0 && now - lastNotified < cooldownMs) {
-          if (this.isDebug()) this.logger.debug(`Cooldown active for ${notifKey}, skipping send`);
-        } else {
-          this.lastNotificationTime.set(notifKey, Date.now());
-          try {
-            await this.notificationService.processTrigger(trigger, symbol, metrics);
-          } catch (err) {
-            this.logger.error(`notificationService failed for trigger=${trigger.id} symbol=${symbol}:`, err);
-          }
+        // C. Сценарий ТРЕКИНГА: Мы уже следим, обновляем пик или проверяем откат
+        if (reversionState) {
+            // C1. Обновляем пик, если цена идет дальше в сторону тренда
+            if (trigger.direction === 'up') {
+                if (currentPrice > reversionState.peakPrice) {
+                    reversionState.peakPrice = currentPrice;
+                    this.pendingReversions.set(checkKey, reversionState);
+                    return; // Цена растет, ждем дальше
+                }
+            } else { // down
+                if (currentPrice < reversionState.peakPrice) {
+                    reversionState.peakPrice = currentPrice;
+                    this.pendingReversions.set(checkKey, reversionState);
+                    return; // Цена падает, ждем дальше
+                }
+            }
+
+            // C2. Проверяем ОТКАТ (Pullback)
+            let pullbackPercent = 0;
+            if (trigger.direction === 'up') {
+                // Насколько упали от хая?
+                pullbackPercent = (reversionState.peakPrice - currentPrice) / reversionState.peakPrice;
+            } else {
+                // Насколько отскочили от дна?
+                pullbackPercent = (currentPrice - reversionState.peakPrice) / reversionState.peakPrice;
+            }
+
+            if (pullbackPercent >= REVERSION_DROP_THRESHOLD) {
+                // ✅ УРА! Откат подтвержден (0.5%)
+                this.logger.info(
+                    `📉 Reversion CONFIRMED for ${symbol}: Peak ${reversionState.peakPrice} -> Cur ${currentPrice} ` +
+                    `(-${(pullbackPercent*100).toFixed(2)}%)`
+                );
+                
+                // Удаляем из слежки — пропускаем код дальше к отправке
+                this.pendingReversions.delete(checkKey);
+            } else {
+                return; // 🛑 Рано, откат слишком маленький (например, всего 0.1%)
+            }
         }
       } else {
-        // reset consecutive count
-        this.consecutiveFires.delete(checkKey);
+          // Если порог не пробит и мы не следим — делать нечего
+          this.consecutiveFires.delete(checkKey);
+          return;
       }
+      
+      // ===========================================
+      // 🚀 SENDING SIGNAL
+      // ===========================================
+      // Если код дошел сюда, значит Reversion Confirmed и пора слать сигнал
+
+      const prev = this.consecutiveFires.get(checkKey) || 0;
+      const nowCount = prev + 1;
+      this.consecutiveFires.set(checkKey, nowCount);
+
+      this.logger.info(`Trigger ${trigger.id} fired for ${symbol} (count=${nowCount})`);
+
+      const notifKey = `${trigger.id}_${symbol}`;
+      const lastNotified = this.lastNotificationTime.get(notifKey) || 0;
+      const cooldownMs = (trigger.notificationLimitSeconds || 0) * 1000;
+
+      if (cooldownMs > 0 && Date.now() - lastNotified < cooldownMs) {
+        if (this.isDebug()) this.logger.debug(`Cooldown active for ${notifKey}, skipping send`);
+      } else {
+        this.lastNotificationTime.set(notifKey, Date.now());
+        try {
+          await this.notificationService.processTrigger(trigger, symbol, metrics);
+        } catch (err) {
+          this.logger.error(`notificationService failed for trigger=${trigger.id} symbol=${symbol}:`, err);
+        }
+      }
+
     } catch (err) {
       this.logger.error(`Error checking trigger ${trigger.id} for ${symbol}:`, err);
+      // Safety Cleanup
       this.consecutiveFires.delete(checkKey);
+      this.pendingReversions.delete(checkKey);
     }
   }
 
-  // Safer comparison with NaN handling. For "down" triggers, threshold is treated as positive percent.
+  // Сравнение значений с учетом направления
   private shouldTriggerFire(trigger: Trigger, metrics: { priceChangePercent: number }): boolean {
     const actual = metrics?.priceChangePercent;
     if (!Number.isFinite(actual)) return false;
@@ -278,11 +337,10 @@ export class TriggerEngineService implements ITriggerEngineService {
     const threshold = Number(trigger.priceChangePercent) || 0;
     if (trigger.direction === 'up') return actual >= threshold;
 
-    // down: actual is usually negative, threshold is positive
+    // для down сравниваем отрицательные числа (-10 < -8)
     return actual <= -Math.abs(threshold);
   }
 
-  // dynamic check interval/backoff based on consecutive fires
   private calculateCheckInterval(consecutiveFireCount: number): number {
     if (consecutiveFireCount < this.DEBOUNCE_THRESHOLD) return this.MIN_CHECK_INTERVAL_MS;
     const power = Math.min(consecutiveFireCount - this.DEBOUNCE_THRESHOLD + 1, 8);
@@ -298,11 +356,7 @@ export class TriggerEngineService implements ITriggerEngineService {
         : [];
 
       const uptime = this.uptimeService.getUptime?.() || 0;
-      if (this.isDebug()) {
-        this.logger.debug(`Health: triggers=${activeTriggers?.length || 0} symbols=${symbols?.length || 0} uptime=${uptime}`);
-      } else {
-        this.logger.info(`Health: triggers=${activeTriggers?.length || 0} symbols=${symbols?.length || 0}`);
-      }
+      this.logger.info(`Health: triggers=${activeTriggers?.length || 0} symbols=${symbols?.length || 0} armedReversions=${this.pendingReversions.size}`);
     } catch (err) {
       this.logger.debug('Health check failed', err);
     }
@@ -310,21 +364,19 @@ export class TriggerEngineService implements ITriggerEngineService {
 
   private cleanupFireCounters(): void {
     const now = Date.now();
-    const staleThreshold = 30 * 60 * 1000; // 30 minutes
+    const staleThreshold = 30 * 60 * 1000;
 
     for (const [k, ts] of Array.from(this.lastCheckTime.entries())) {
       if (now - ts > staleThreshold) {
         this.lastCheckTime.delete(k);
         this.consecutiveFires.delete(k);
+        this.pendingReversions.delete(k); // Чистим зависшие реверсии
       }
     }
 
-    // also cleanup notification times a bit older
     for (const [k, ts] of Array.from(this.lastNotificationTime.entries())) {
       if (now - ts > 24 * 60 * 60 * 1000) this.lastNotificationTime.delete(k);
     }
-
-    if (this.isDebug()) this.logger.debug(`Cleanup done: checks=${this.lastCheckTime.size} fires=${this.consecutiveFires.size}`);
   }
 
   private isDebug(): boolean {
