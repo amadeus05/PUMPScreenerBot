@@ -1,5 +1,5 @@
 import { Repository } from 'typeorm';
-import { Inject, Injectable } from '../../shared/decorators';
+import { Injectable } from '../../shared/decorators';
 import { AppDataSource } from '../database/database.module';
 import { Signal } from '../../domain/entities/signal.entity';
 import { ISignalRepository } from '../../domain/interfaces/repositories.interface';
@@ -12,17 +12,13 @@ export class SignalRepository implements ISignalRepository {
     this.repository = AppDataSource.getRepository(Signal);
   }
 
-  // Принимаем userId, но пока не используем, т.к. в Signal нет этого поля.
-  // Это позволит остальному коду работать корректно.
   async getLast24HoursSignalCount(userId: number): Promise<number> {
     const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    return (
-      this.repository
-        .createQueryBuilder('signal')
-        .where('signal.createdAt >= :date', { date: twentyFourHoursAgo })
-        // TODO: Добавить `andWhere('signal.userId = :userId', { userId })` когда поле будет добавлено
-        .getCount()
-    );
+    return this.repository
+      .createQueryBuilder('signal')
+      .where('signal.createdAt >= :date', { date: twentyFourHoursAgo })
+      // .andWhere('signal.userId = :userId', { userId }) // TODO: раскомментировать позже
+      .getCount();
   }
 
   async save(signal: Signal): Promise<Signal> {
@@ -35,20 +31,18 @@ export class SignalRepository implements ISignalRepository {
       .createQueryBuilder('signal')
       .where('signal.symbol = :symbol', { symbol })
       .andWhere('signal.createdAt >= :since', { since })
+      .orderBy('signal.createdAt', 'DESC') // Добавил сортировку, чтобы свежие были первыми
       .getMany();
   }
 
   async getLast24HoursSignalCountBySymbol(userId: number, symbol: string): Promise<number> {
     const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-
-    return (
-      this.repository
-        .createQueryBuilder('signal')
-        .where('signal.symbol = :symbol', { symbol })
-        .andWhere('signal.createdAt >= :date', { date: twentyFourHoursAgo })
-        // TODO: Добавить userId когда поле будет в Signal entity
-        .getCount()
-    );
+    return this.repository
+      .createQueryBuilder('signal')
+      .where('signal.symbol = :symbol', { symbol })
+      .andWhere('signal.createdAt >= :date', { date: twentyFourHoursAgo })
+      // .andWhere('signal.userId = :userId', { userId }) // TODO
+      .getCount();
   }
 
   async getLast24HoursSignalCountByTriggerAndSymbol(
@@ -64,7 +58,7 @@ export class SignalRepository implements ISignalRepository {
       .getCount();
   }
 
-  // NEW: Get signal statistics for debugging
+  // OPTIMIZED: Агрегация на стороне БД
   async getSignalStats(userId: number): Promise<{
     total24h: number;
     bySymbol: Map<string, number>;
@@ -72,27 +66,39 @@ export class SignalRepository implements ISignalRepository {
   }> {
     const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
 
-    // Get all signals in last 24 hours
-    const signals = await this.repository
+    // 1. Получаем сгруппированную статистику одним запросом
+    // SQL аналог: SELECT symbol, COUNT(*) as cnt FROM signal WHERE ... GROUP BY symbol
+    const rawStats = await this.repository
       .createQueryBuilder('signal')
+      .select('signal.symbol', 'symbol')
+      .addSelect('COUNT(signal.id)', 'cnt') // Считаем количество ID
       .where('signal.createdAt >= :date', { date: twentyFourHoursAgo })
-      .getMany();
+      .groupBy('signal.symbol')
+      .getRawMany(); 
+      // getRawMany вернет массив объектов вида: [{ symbol: 'BTCUSDT', cnt: '15' }, ...]
 
-    // Count by symbol
+    // 2. Преобразуем данные для возврата (mapping)
+    let total24h = 0;
     const bySymbol = new Map<string, number>();
-    for (const signal of signals) {
-      const count = bySymbol.get(signal.symbol) || 0;
-      bySymbol.set(signal.symbol, count + 1);
-    }
 
-    // Get top symbols
-    const topSymbols = Array.from(bySymbol.entries())
-      .map(([symbol, count]) => ({ symbol, count }))
+    const formattedStats = rawStats.map((item) => {
+      // TypeORM часто возвращает COUNT как строку, поэтому нужно parseInt
+      const count = parseInt(item.cnt, 10);
+      const symbol = item.symbol;
+
+      total24h += count;
+      bySymbol.set(symbol, count);
+
+      return { symbol, count };
+    });
+
+    // 3. Сортируем для topSymbols (если БД не сортировала)
+    const topSymbols = formattedStats
       .sort((a, b) => b.count - a.count)
       .slice(0, 10);
 
     return {
-      total24h: signals.length,
+      total24h,
       bySymbol,
       topSymbols,
     };
