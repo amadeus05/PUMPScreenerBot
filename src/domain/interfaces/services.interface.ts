@@ -10,6 +10,8 @@ export interface IMetricChanges {
   readonly currentPrice: number;
   readonly previousPrice: number; // NEW: for context
   readonly timeWindowSeconds: number; // NEW: actual time window measured
+  readonly fallbackApplied?: boolean; // NEW: indicates fallback usage
+  readonly expectedWindowSeconds?: number; // NEW: expected window duration
 }
 
 export interface IDataAggregatorService {

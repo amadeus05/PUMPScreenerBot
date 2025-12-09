@@ -9,21 +9,28 @@ import {
   ProviderHealthStatus,
 } from '../../../domain/interfaces/market-data-provider.interface';
 
-const BINANCE_SPOT_STREAM_URL = 'wss://stream.binance.com:9443/ws/!miniTicker@arr';
-const BINANCE_FUTURES_STREAM_URL = 'wss://fstream.binance.com/ws/!ticker@arr';
-const RECONNECT_DELAY = 5000;
+const BINANCE_SPOT_EXCHANGE_INFO_URL = 'https://api.binance.com/api/v3/exchangeInfo';
+const BINANCE_FUTURES_EXCHANGE_INFO_URL = 'https://fapi.binance.com/fapi/v1/exchangeInfo';
+const BINANCE_SPOT_STREAM_BASE = 'wss://stream.binance.com:9443/stream';
+const BINANCE_FUTURES_STREAM_BASE = 'wss://fstream.binance.com/stream';
+
+const BATCH_SIZE = 30;
+const LOAD_SYMBOLS_RETRIES = 5;
 
 @Injectable()
 export class BinanceMarketDataProvider implements IMarketDataProvider {
   public readonly providerId: string;
   public readonly marketType: MarketType;
   private readonly logger: Logger;
-  private readonly streamUrl: string;
 
-  private ws: WebSocket | null = null;
+  private wsList: WebSocket[] = [];
+  private reconnectTimers = new Set<NodeJS.Timeout>();
   private connected = false;
-  private reconnecting = false;
+  private intentionalDisconnect = false;
   private callback: PriceUpdateCallback | null = null;
+
+  private symbols = new Set<string>();
+  private readyPromise: Promise<void>;
 
   private messageCount = 0;
   private errorCount = 0;
@@ -34,76 +41,232 @@ export class BinanceMarketDataProvider implements IMarketDataProvider {
     this.marketType = marketType;
     this.providerId = `binance-${marketType}`;
     this.logger = new Logger(this.providerId);
-    this.streamUrl = marketType === 'futures' ? BINANCE_FUTURES_STREAM_URL : BINANCE_SPOT_STREAM_URL;
+    this.readyPromise = this.loadSymbolsWithRetry();
+  }
+
+  private async loadSymbolsWithRetry(): Promise<void> {
+    let lastErr: any;
+    for (let attempt = 1; attempt <= LOAD_SYMBOLS_RETRIES; attempt++) {
+      try {
+        await this.loadSymbols();
+        return;
+      } catch (e) {
+        lastErr = e;
+        this.logger.warn(`loadSymbols attempt ${attempt} failed`);
+        await new Promise((r) => setTimeout(r, 2000 * attempt));
+      }
+    }
+    this.logger.error('Failed to load symbols after retries', lastErr);
+    throw lastErr;
+  }
+
+  private async loadSymbols(): Promise<void> {
+    const url =
+      this.marketType === 'futures'
+        ? BINANCE_FUTURES_EXCHANGE_INFO_URL
+        : BINANCE_SPOT_EXCHANGE_INFO_URL;
+
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'BinanceMarketDataProvider/1.0' },
+      signal: (AbortSignal as any).timeout ? AbortSignal.timeout(10_000) : undefined,
+    });
+
+    if (!res.ok) throw new Error(`Exchange info fetch failed: ${res.status}`);
+
+    const data: any = await res.json();
+    this.symbols.clear();
+
+    for (const s of data.symbols || []) {
+      if (this.marketType === 'futures') {
+        if (
+          s.contractType === 'PERPETUAL' &&
+          s.marginAsset === 'USDT' &&
+          s.status === 'TRADING'
+        ) {
+          this.symbols.add(s.symbol);
+        }
+      } else {
+        if (s.status === 'TRADING' && s.symbol.endsWith('USDT')) {
+          this.symbols.add(s.symbol);
+        }
+      }
+    }
+
+    this.logger.info(`Loaded ${this.symbols.size} ${this.marketType} symbols`);
+  }
+
+  private createBatchWS(batch: string[]): WebSocket {
+    const streamName = this.marketType === 'futures' ? 'ticker' : 'ticker';
+    const streams = batch.map((s) => `${s.toLowerCase()}@${streamName}`).join('/');
+    const baseUrl =
+      this.marketType === 'futures' ? BINANCE_FUTURES_STREAM_BASE : BINANCE_SPOT_STREAM_BASE;
+    const url = `${baseUrl}?streams=${streams}`;
+
+    const ws = new WebSocket(url);
+    let closedByUs = false;
+
+    ws.on('open', () => {
+      this.logger.debug(`Batch WS connected (${batch.length} symbols)`);
+    });
+
+    ws.on('message', (data) => {
+      this.handleMessage(data.toString());
+    });
+
+    ws.on('error', (err) => {
+      this.logger.error('Batch WS error', err);
+    });
+
+    ws.on('close', () => {
+      if (closedByUs) return;
+      this.logger.warn(`Batch WS closed — reconnecting in 3s (${batch.length} symbols)`);
+      const timer = setTimeout(() => {
+        this.reconnectTimers.delete(timer);
+        if (this.intentionalDisconnect || !this.connected) return;
+        try {
+          const newWs = this.createBatchWS(batch);
+          const idx = this.wsList.indexOf(ws);
+          if (idx !== -1) this.wsList[idx] = newWs;
+          else this.wsList.push(newWs);
+        } catch (e) {
+          this.logger.error('Failed to recreate batch WS', e);
+        }
+      }, 3000);
+      this.reconnectTimers.add(timer);
+    });
+
+    Object.defineProperty(ws, '_closeGracefully', {
+      value: () => {
+        closedByUs = true;
+        try {
+          ws.terminate();
+        } catch (e) {}
+      },
+      writable: false,
+    });
+
+    return ws;
+  }
+
+  private subscribeToBatches(): void {
+    // Закрываем существующие соединения
+    this.wsList.forEach((ws: any) => {
+      try {
+        if (typeof ws._closeGracefully === 'function') ws._closeGracefully();
+        else ws.terminate();
+      } catch (e) {}
+    });
+    this.wsList = [];
+
+    const symbolsArray = Array.from(this.symbols);
+    for (let i = 0; i < symbolsArray.length; i += BATCH_SIZE) {
+      const batch = symbolsArray.slice(i, i + BATCH_SIZE);
+      const ws = this.createBatchWS(batch);
+      this.wsList.push(ws);
+    }
+
+    this.logger.info(
+      `Subscribed to ${symbolsArray.length} symbols in ${this.wsList.length} batches`
+    );
+  }
+
+  private handleMessage(raw: string): void {
+    if (!this.callback) return;
+
+    try {
+      const msg = JSON.parse(raw);
+      // Для батч стримов данные приходят в формате { stream: "...", data: {...} }
+      const ticker = msg.data;
+
+      if (!ticker) return;
+
+      const symbol: string = ticker.s || ticker.S;
+      if (!symbol?.endsWith('USDT')) return;
+
+      if (this.marketType === 'futures') {
+        if (symbol.includes('_') || !this.symbols.has(symbol)) return;
+      } else {
+        if (!this.symbols.has(symbol)) return;
+      }
+
+      const price = parseFloat(ticker.c || ticker.C);
+      if (isNaN(price) || price <= 0) return;
+
+      this.messageCount++;
+      this.lastUpdateTime = Date.now();
+
+      const update: PriceUpdateData = {
+        providerId: this.providerId,
+        marketType: this.marketType,
+        symbol,
+        price,
+        timestamp: ticker.E || Date.now(),
+      };
+
+      if (this.marketType === 'futures') {
+        if (ticker.p) update.markPrice = parseFloat(ticker.p);
+        if (ticker.r) update.fundingRate = parseFloat(ticker.r);
+      }
+
+      try {
+        this.callback(update);
+      } catch (e) {
+        this.logger.error('Callback error in handleMessage', e);
+      }
+    } catch (e) {
+      this.errorCount++;
+      this.logger.debug('Message parse error', e);
+    }
   }
 
   public async connect(): Promise<void> {
     if (this.connected) return;
 
-    return new Promise((resolve, reject) => {
-      try {
-        this.logger.info(`Connecting to ${this.streamUrl}...`);
-        this.ws = new WebSocket(this.streamUrl);
+    await this.readyPromise;
 
-        this.ws.on('open', () => {
-          this.connected = true;
-          this.reconnecting = false;
-          this.reconnectAttempts = 0;
-          this.logger.info(`Connected to Binance ${this.marketType}`);
-          resolve();
-        });
+    this.connected = true;
+    this.reconnectAttempts = 0;
+    this.intentionalDisconnect = false;
 
-        this.ws.on('message', (data: WebSocket.Data) => {
-          try {
-            const messages = JSON.parse(data.toString());
-            this.handleMessages(messages);
-          } catch (error) {
-            this.errorCount++;
-            this.logger.error('Parse error:', error);
-          }
-        });
-
-        this.ws.on('error', (error) => {
-          this.errorCount++;
-          this.logger.error('WebSocket error:', error);
-          if (!this.connected) reject(error);
-        });
-
-        this.ws.on('close', () => {
-          this.connected = false;
-          this.logger.warn('Connection closed');
-          this.handleReconnection();
-        });
-      } catch (error) {
-        reject(error);
-      }
-    });
+    this.subscribeToBatches();
+    this.logger.info(`Connected to Binance ${this.marketType}`);
   }
 
   public async disconnect(): Promise<void> {
+    this.intentionalDisconnect = true;
     this.connected = false;
-    if (this.ws) {
-      this.ws.close();
-      this.ws = null;
-    }
+
+    // Очищаем все pending reconnect таймеры
+    this.reconnectTimers.forEach((timer) => clearTimeout(timer));
+    this.reconnectTimers.clear();
+
+    // Закрываем все WebSocket соединения
+    this.wsList.forEach((ws: any) => {
+      try {
+        if (typeof ws._closeGracefully === 'function') ws._closeGracefully();
+        else ws.terminate();
+      } catch (e) {}
+    });
+    this.wsList = [];
+
     this.logger.info('Disconnected');
+  }
+
+  public async unsubscribe(): Promise<void> {
+    await this.disconnect();
   }
 
   public isConnected(): boolean {
     return this.connected;
   }
 
-  public async subscribe(symbols: string[]): Promise<void> {
-    // Binance all-ticker stream doesn't need subscription
-    this.logger.debug('Subscription not needed (all symbols stream)');
-  }
-
-  public async unsubscribe(symbols: string[]): Promise<void> {
-    // Not applicable
+  public async subscribe(): Promise<void> {
+    // Уже подписаны при connect
   }
 
   public async getAvailableSymbols(): Promise<string[]> {
-    return [];
+    await this.readyPromise;
+    return Array.from(this.symbols);
   }
 
   public onPriceUpdate(callback: PriceUpdateCallback): void {
@@ -122,67 +285,4 @@ export class BinanceMarketDataProvider implements IMarketDataProvider {
     };
   }
 
-  private handleMessages(messages: any[]): void {
-    if (!this.callback) return;
-
-    for (const msg of messages) {
-      try {
-        const symbol = msg.s;
-        
-        // Filter only USDT pairs
-        if (!symbol?.endsWith('USDT')) continue;
-        
-        // For futures: exclude quarterly contracts (e.g., BTCUSDT_250328)
-        if (this.marketType === 'futures' && symbol.includes('_')) continue;
-
-        const price = parseFloat(msg.c);
-        const timestamp = msg.E;
-
-        if (symbol && price > 0 && timestamp) {
-          this.messageCount++;
-          this.lastUpdateTime = Date.now();
-
-          const data: PriceUpdateData = {
-            providerId: this.providerId,
-            marketType: this.marketType,
-            symbol,
-            price,
-            timestamp,
-            volume: msg.v ? parseFloat(msg.v) : undefined,
-            quoteVolume: msg.q ? parseFloat(msg.q) : undefined,
-          };
-
-          // Futures-specific fields
-          if (this.marketType === 'futures') {
-            data.markPrice = msg.p ? parseFloat(msg.p) : undefined;
-            data.fundingRate = msg.r ? parseFloat(msg.r) : undefined;
-          }
-
-          this.callback(data);
-        }
-      } catch (error) {
-        this.errorCount++;
-        this.logger.debug('Message processing error:', error);
-      }
-    }
-  }
-
-  private async handleReconnection(): Promise<void> {
-    if (this.reconnecting || !this.connected) return;
-
-    this.reconnecting = true;
-    this.reconnectAttempts++;
-    this.logger.info(`Reconnecting... (attempt ${this.reconnectAttempts})`);
-
-    await this.disconnect();
-    await new Promise((resolve) => setTimeout(resolve, RECONNECT_DELAY));
-
-    try {
-      await this.connect();
-    } catch (error) {
-      this.logger.error('Reconnection failed:', error);
-      this.reconnecting = false;
-      this.handleReconnection();
-    }
-  }
 }

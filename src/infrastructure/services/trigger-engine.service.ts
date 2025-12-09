@@ -216,11 +216,13 @@ export class TriggerEngineService implements ITriggerEngineService {
         metrics = cached.metrics;
       } else {
         metrics = await this.dataAggregator.getMetricChanges(symbol, trigger.timeIntervalMinutes);
-        // ensure metrics has currentPrice (prefer newest tick)
         if (!metrics) {
           this.metricCache.set(metricKey, { ts: Date.now(), metrics: null });
         } else {
-          metrics.currentPrice = currentPrice;
+          // ВАЖНО: не перезаписываем currentPrice из агрегатора,
+          // чтобы priceChangePercent, previousPrice и currentPrice
+          // всегда были согласованы между собой (движение считается
+          // относительно цены конца найденного свинга, а не последнего тика).
           this.metricCache.set(metricKey, { ts: Date.now(), metrics });
         }
       }

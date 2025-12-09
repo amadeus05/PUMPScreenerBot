@@ -15,7 +15,6 @@ config();
 // Import all necessary classes to ensure decorators are executed
 import './infrastructure/repositories/signal.repository';
 import './infrastructure/repositories/symbol-metadata.repository';
-import './infrastructure/services/binance-websocket.service';
 import './infrastructure/telegram/telegram.bot';
 import './presentation/telegram/handlers/command.handler';
 import './presentation/telegram/handlers/signal.handler';

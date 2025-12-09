@@ -14,8 +14,10 @@ export class TelegramBotService {
   private readonly MAX_MESSAGES_PER_SECOND = 25;
   private readonly RATE_LIMIT_WINDOW_MS = 1000;
 
-  // Detect market type from ENV for proper link generation
   private readonly marketType: string;
+
+  // ✅ FIX: Store timer reference for cleanup
+  private cleanupTimer: NodeJS.Timeout | null = null;
 
   constructor(token: string) {
     if (!token) {
@@ -25,17 +27,13 @@ export class TelegramBotService {
     this.setupErrorHandling();
     this.setBotCommands();
 
-    // Detect primary market type from configuration
     this.marketType = this.detectMarketType();
     this.logger.info(`Telegram links configured for: ${this.marketType}`);
 
-    // Cleanup old queue entries every minute
-    setInterval(() => this.cleanupQueues(), 60_000);
+    // ✅ FIX: Store timer reference
+    this.cleanupTimer = setInterval(() => this.cleanupQueues(), 60_000);
   }
 
-  /**
-   * Set up bot commands menu in Telegram
-   */
   private async setBotCommands(): Promise<void> {
     try {
       await this.bot.setMyCommands([
@@ -56,7 +54,6 @@ export class TelegramBotService {
 
   public async sendMessage(chatId: number, message: string): Promise<void> {
     try {
-      // Check rate limit
       if (!(await this.checkRateLimit(chatId))) {
         this.logger.warn(`Rate limit exceeded for chat ${chatId}, message queued`);
         await this.delay(1000);
@@ -67,7 +64,6 @@ export class TelegramBotService {
         disable_web_page_preview: true,
       });
 
-      // Track message
       this.trackMessage(chatId);
     } catch (error) {
       this.logger.error(`Failed to send Telegram message to chat ${chatId}:`, error);
@@ -99,7 +95,6 @@ export class TelegramBotService {
     const prevPriceStr = this.formatPrice(signal.previousPrice);
     const intervalDisplay = triggerIntervalMinutes ? `${triggerIntervalMinutes}m` : '';
 
-    // Generate links based on market type
     const binanceLink = this.generateBinanceLink(signal.symbol);
     const tradingViewLink = this.generateTradingViewLink(signal.symbol);
 
@@ -110,24 +105,13 @@ ${formatPercent(signal.priceChangePercent)} <a href="${tradingViewLink}">Chart</
     `.trim();
   }
 
-  /**
-   * Smart price formatting based on value magnitude
-   */
   private formatPrice(price: number): string {
-    if (price >= 1000) {
-      return price.toFixed(2);
-    } else if (price >= 1) {
-      return price.toFixed(4);
-    } else if (price >= 0.01) {
-      return price.toFixed(4);
-    } else {
-      return price.toFixed(6);
-    }
+    if (price >= 1000) return price.toFixed(2);
+    if (price >= 1) return price.toFixed(4);
+    if (price >= 0.01) return price.toFixed(4);
+    return price.toFixed(6);
   }
 
-  /**
-   * Generate Binance link based on market type
-   */
   private generateBinanceLink(symbol: string): string {
     if (this.marketType === 'futures') {
       return `https://www.binance.com/ru/futures/${symbol}`;
@@ -135,22 +119,14 @@ ${formatPercent(signal.priceChangePercent)} <a href="${tradingViewLink}">Chart</
     return `https://www.binance.com/ru/trade/${symbol}`;
   }
 
-  /**
-   * Generate TradingView link based on market type
-   */
   private generateTradingViewLink(symbol: string): string {
     if (this.marketType === 'futures') {
-      // Perpetual futures suffix
       return `https://www.tradingview.com/chart/?symbol=BINANCE:${symbol}.P`;
     }
     return `https://www.tradingview.com/chart/?symbol=BINANCE:${symbol}`;
   }
 
-  /**
-   * Detect primary market type from environment configuration
-   */
   private detectMarketType(): string {
-    // Check inline format first
     const providers = process.env.MARKET_DATA_PROVIDERS || '';
     if (providers.includes(':')) {
       const firstProvider = providers.split(',')[0];
@@ -158,19 +134,16 @@ ${formatPercent(signal.priceChangePercent)} <a href="${tradingViewLink}">Chart</
       if (marketType) return marketType.toLowerCase();
     }
 
-    // Check specific Binance config
     const binanceMarketType = process.env.BINANCE_MARKET_TYPE?.toLowerCase();
     if (binanceMarketType === 'spot' || binanceMarketType === 'futures') {
       return binanceMarketType;
     }
 
-    // Check global market type
     const globalMarketType = process.env.MARKET_TYPE?.toLowerCase();
     if (globalMarketType === 'spot' || globalMarketType === 'futures') {
       return globalMarketType;
     }
 
-    // Default to spot
     return 'spot';
   }
 
@@ -230,6 +203,12 @@ ${formatPercent(signal.priceChangePercent)} <a href="${tradingViewLink}">Chart</
   }
 
   public async stop(): Promise<void> {
+    // ✅ FIX: Clear timer
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+      this.cleanupTimer = null;
+    }
+
     if (this.bot.isPolling()) {
       await this.bot.stopPolling();
     }
