@@ -59,7 +59,6 @@ export class TelegramBotService {
     await this.sendMessage(chatId, message);
   }
 
-  // ✅ UPDATED: Removed quality indicator, cleaner format
   private formatSignalMessage(signal: SignalDto, triggerIntervalMinutes?: number): string {
     const formatPercent = (value: number): string => {
       const sign = value >= 0 ? '📈' : '📉';
@@ -76,11 +75,12 @@ export class TelegramBotService {
     const prevPriceStr = this.formatPrice(signal.previousPrice);
     const intervalDisplay = triggerIntervalMinutes ? `${triggerIntervalMinutes}m` : '';
 
-    // ✅ FIX: Changed to spot trading links (removed futures)
-    const binanceLink = `https://www.binance.com/ru/trade/${signal.symbol}`;
-    const tradingViewLink = `https://www.tradingview.com/chart/?symbol=BINANCE:${signal.symbol}`;
+    // ✅ FIX: Ссылка на Binance Futures
+    const binanceLink = `https://www.binance.com/ru/futures/${signal.symbol}`;
+    
+    // ✅ FIX: Ссылка на TradingView Futures (добавлено .P для Perpetual контракта)
+    const tradingViewLink = `https://www.tradingview.com/chart/?symbol=BINANCE:${signal.symbol}.P`;
 
-    // ✅ NEW: Minimalist format without quality indicator
     return `
 🚨 №${signal.signalNumber} - <a href="${binanceLink}">${signal.symbol}</a> ${intervalDisplay}
 ${formatPercent(signal.priceChangePercent)} <a href="${tradingViewLink}">Chart</a>
