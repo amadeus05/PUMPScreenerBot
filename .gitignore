@@ -9,8 +9,8 @@ dist/
 build/
 
 # Database
-database.sqlite
 *.db
+/data
 
 # Environment variables
 .env
@@ -19,14 +19,14 @@ database.sqlite
 .env.test
 
 # Logs
-combined.log
-error.log
-
-# Winston daily rotate audit files
-/*-audit.json
+/logs
 
 # Rotated log files
 /combined-*.log
+
+
+# Winston daily rotate audit files
+/*-audit.json
 
 # Temporary files
 .tmp/

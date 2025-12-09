@@ -1,7 +1,6 @@
 // src/domain/interfaces/repositories.interface.ts
 
 import { Signal } from '../entities/signal.entity';
-import { SymbolMetadata } from '../entities/symbol-metadata.entity';
 import { Trigger } from '../entities/trigger.entity';
 import { CreateTriggerDto } from '../../application/dto/create-trigger.dto';
 
@@ -19,11 +18,4 @@ export interface ISignalRepository {
   getLast24HoursSignalCountBySymbol(userId: number, symbol: string): Promise<number>;
   save(signal: Signal): Promise<Signal>;
   findRecentBySymbol(symbol: string, hours: number): Promise<Signal[]>;
-}
-
-export interface ISymbolMetadataRepository {
-  findAllActive(): Promise<SymbolMetadata[]>;
-  findBySymbol(symbol: string): Promise<SymbolMetadata | null>;
-  save(metadata: SymbolMetadata): Promise<SymbolMetadata>;
-  updateActiveSymbols(symbols: string[]): Promise<void>;
 }

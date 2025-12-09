@@ -17,9 +17,9 @@ export class Logger {
         new winston.transports.Console({
           format: winston.format.combine(winston.format.colorize(), winston.format.simple()),
         }),
-        new winston.transports.File({ filename: 'error.log', level: 'error' }),
+        new winston.transports.File({ filename: './logs/error.log', level: 'error' }),
         new DailyRotateFile({
-          filename: 'combined-%DATE%.log',
+          filename: './logs/combined-%DATE%.log',
           datePattern: 'YYYY-MM-DD-HH-mm', // Формат имени файла
           frequency: '5m', // Ротация каждые 5 минут
           maxSize: '10m', // Максимальный размер файла 10MB

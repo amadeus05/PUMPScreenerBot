@@ -1,6 +1,5 @@
 import { DIContainer } from './shared/container';
 import { SignalRepository } from './infrastructure/repositories/signal.repository';
-import { SymbolMetadataRepository } from './infrastructure/repositories/symbol-metadata.repository';
 import { TriggerRepository } from './infrastructure/repositories/trigger.repository';
 import { UptimeService } from './infrastructure/services/uptime.service';
 
@@ -28,8 +27,7 @@ export function registerDependencies(): void {
   // --- Register Repositories ---
   container.bind('ITriggerRepository', () => new TriggerRepository());
   container.bind('ISignalRepository', () => new SignalRepository());
-  container.bind('ISymbolMetadataRepository', () => new SymbolMetadataRepository());
-
+  
   // --- Register Use Cases ---
   container.bind(
     CreateTriggerUseCase,
