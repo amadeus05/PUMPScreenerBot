@@ -1,13 +1,3 @@
-// Production-Ready Data Aggregator Service v2.3
-// Features:
-// - Event-time OHLC with out-of-order support
-// - Boundary interpolation (linear, production-grade)
-// - Dynamic coverage thresholds (90% for 1m, 80% for 30m+)
-// - minBuckets = 60% of minutes
-// - SortedBucketMap with O(1) sorted keys
-// - LRU + TTL eviction
-// - Health monitoring + warmup/fallback metrics
-
 import { Injectable } from "../../shared/decorators";
 import {
   IDataAggregatorService,
@@ -141,7 +131,17 @@ export class DataAggregatorService implements IDataAggregatorService {
       return;
     }
 
-    const maxFuture = Date.now() + 60_000;
+    const now = Date.now();
+    const maxFuture = now + 60_000;
+    
+    // 🛡️ SECURITY FIX: Игнорируем слишком старые данные (Time Travel protection)
+    // Если тик старше, чем максимальная история хранения, он бесполезен и может вызвать баги
+    const maxHistoryAge = this.MAX_MINUTE_BUCKETS * 60 * 1000;
+    if (timestamp < now - maxHistoryAge) {
+       // Тихий пропуск, чтобы не спамить логами при старте
+       return; 
+    }
+
     const safeTs = Math.min(Math.floor(timestamp), maxFuture);
 
     this.lastKnownPrices.set(symbol, price);
@@ -163,7 +163,6 @@ export class DataAggregatorService implements IDataAggregatorService {
     }
 
     this.totalUpdates++;
-    const now = Date.now();
 
     if (now - this.lastSymbolCheck > this.SYMBOL_CHECK_INTERVAL) {
       this.lastSymbolCheck = now;
@@ -375,6 +374,7 @@ export class DataAggregatorService implements IDataAggregatorService {
     this.cleanupBuckets(store, symbol, bucketSize);
   }
 
+  // ⚡ MAJOR OPTIMIZATION HERE
   private cleanupBuckets(
     store: Map<string, SortedBucketMap>,
     symbol: string,
@@ -384,8 +384,15 @@ export class DataAggregatorService implements IDataAggregatorService {
     if (!map) return;
 
     const limit = bucketSize === 15_000 ? this.MAX_15S_BUCKETS : this.MAX_MINUTE_BUCKETS;
-    const keys = map.getSortedKeys();
+    
+    // OPTIMIZATION: Сначала проверяем размер (O(1)), чтобы не сортировать ключи зря.
+    // Если элементов меньше лимита, выходим сразу.
+    if (map.size <= limit) return;
 
+    // Сортировка происходит только если РЕАЛЬНО нужно удалять
+    const keys = map.getSortedKeys();
+    
+    // Double check (на всякий случай, хотя if выше уже отсек)
     if (keys.length <= limit) return;
 
     const removing = keys.length - limit;
@@ -577,7 +584,8 @@ export class DataAggregatorService implements IDataAggregatorService {
   }
 
   private interpolate(t0: number, p0: number, t1: number, p1: number, t: number): number {
-    if (t1 === t0) return p0;
+    // Небольшая защита от деления на ноль при совпадении времени (floating point protection)
+    if (Math.abs(t1 - t0) < 0.00001) return p0;
     const ratio = (t - t0) / (t1 - t0);
     return p0 + (p1 - p0) * ratio;
   }
