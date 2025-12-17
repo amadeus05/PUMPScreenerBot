@@ -1,4 +1,8 @@
 import 'reflect-metadata';
+
+import express from 'express';
+import type { Request, Response } from 'express';
+
 import { config } from 'dotenv';
 import { DIContainer } from './shared/container';
 import { DatabaseModule } from './infrastructure/database/database.module';
@@ -18,6 +22,22 @@ import './presentation/telegram/handlers/signal.handler';
 import { PumpScoutBot } from './app';
 
 const logger = new Logger('Main');
+
+const server = express();
+const PORT: number = Number(process.env.PORT) || 3000; // Render требует переменную PORT
+
+// Здоровье бота
+server.get('/health', (_req: Request, res: Response) => {
+  res.status(200).send('Pump Scout Bot is alive!');
+});
+
+server.get('/', (_req: Request, res: Response) => {
+  res.send('<h1>Я на связи!</h1><p>/health — <- проверить пульс <3 </p>');
+});
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`Fake Express server listening on port ${PORT}`);
+});
 
 process.on('uncaughtException', (error) => {
   logger.error('Uncaught Exception:', error);
